@@ -7,19 +7,20 @@ name = "evalstat"
 version = "0.0.1"
 description = "Statistical validity tooling for LLM and agent evaluations."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "MIT" }
-authors = [{ name = "omstechops", email = "325673804+omstechops@users.noreply.github.com" }]
+authors = [
+    { name = "omstechops", email = "325673804+omstechops@users.noreply.github.com" },
+]
 keywords = ["evaluation", "statistics", "llm", "power-analysis", "bootstrap"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Mathematics",
     "Typing :: Typed",
 ]
@@ -47,6 +48,9 @@ packages = ["src/evalstat"]
 minversion = "8.0"
 testpaths = ["tests"]
 addopts = "-q --strict-markers --strict-config"
+markers = [
+    "slow: coverage simulations; hundreds of bootstraps, minutes not seconds",
+]
 filterwarnings = ["error"]
 
 [tool.coverage.run]
@@ -55,7 +59,7 @@ branch = true
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
@@ -88,6 +92,16 @@ convention = "numpy"
 docstring-code-format = true
 
 [tool.mypy]
-python_version = "3.10"
+# numpy ships stubs that use `type` statements, which mypy only parses when its
+# target is 3.12+. requires-python was raised to match: a >=3.10 floor that
+# neither mypy nor any test run actually exercises is an unverified claim, and
+# unverified claims do not get published. A 3.10 floor can come back when CI
+# runs a 3.10 matrix that proves it.
+python_version = "3.12"
 files = ["src", "tests"]
 strict = true
+
+[[tool.mypy.overrides]]
+# scipy publishes no stubs of its own; only norm.ppf/norm.cdf are used here.
+module = "scipy.*"
+ignore_missing_imports = true

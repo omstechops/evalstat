@@ -1,10 +1,25 @@
 """Statistical validity tooling for LLM and agent evaluations.
 
-The public API is intentionally empty at this stage: the package skeleton is in
-place, but every statistical function is added only after its test case and its
-assumptions have been written down.
+Every function here arrives with its assumptions written down and a test built
+on a case whose answer is known independently of this code.
 """
+
+from evalstat.bootstrap import (
+    MIN_CLUSTERS,
+    MIN_VALID_FRACTION,
+    DegenerateResampleWarning,
+    FewClustersWarning,
+    PairedBootstrapResult,
+    paired_bootstrap,
+)
 
 __version__ = "0.0.1"
 
-__all__: list[str] = []
+__all__ = [
+    "MIN_CLUSTERS",
+    "MIN_VALID_FRACTION",
+    "DegenerateResampleWarning",
+    "FewClustersWarning",
+    "PairedBootstrapResult",
+    "paired_bootstrap",
+]
