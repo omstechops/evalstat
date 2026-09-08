@@ -11,3 +11,9 @@ dist/
 .coverage
 htmlcov/
 .DS_Store
+
+# Yayınlanmayan çalışma malzemesi
+fikir-*.md
+*.pptx
+gun-*-kapanis.md
+gun-*-kapanış.md

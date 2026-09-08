@@ -8,19 +8,20 @@ her şey İngilizce.**
 
 ## İki proje, tek omurga
 
-Bu depo(lar) iki paralel projeyi barındırır. Bağımsız değiller:
+Bu depo Proje A'dır. İki paralel proje var, bağımsız değiller:
 
-- **Proje A — `evalstat`:** LLM/ajan değerlendirmelerinin istatistiksel geçerliliği
+- **Proje A — `evalstat`:** (bu depo) LLM/ajan değerlendirmelerinin istatistiksel geçerliliği
   için Python paketi. Güç analizi, eşleştirilmiş bootstrap, çoklu karşılaştırma
   düzeltmesi, LLM-hakem uyum ölçümü, alt grup kırılımı.
-- **Proje B — `tr-speech-eval`:** Türkçe konuşma sistemleri (ASR/TTS/ses ajanı)
+- **Proje B — `tr-speech-eval`:** (https://github.com/omstechops/tr-speech-eval)
+  Türkçe konuşma sistemleri (ASR/TTS/ses ajanı)
   için değerlendirme seti + ses ajanı prototipi.
 
 **A metodu üretir, B o metodu uygular.** B'nin her istatistiksel sonucu A ile
 hesaplanır. Bu bağ projenin ana fikridir; kopmasına izin verme.
 
-Detaylı planlar: `@docs/proje-a-eval-istatistigi.md`, `@docs/proje-b-turkce-ses-ai.md`,
-`@docs/yol-haritasi.md`
+Detaylı planlar (`proje-a-eval-istatistigi.md`, `proje-b-turkce-ses-ai.md`,
+`yol-haritasi.md`) yayınlanmıyor; özel çalışma deposunda kalıyor.
 
 ---
 
