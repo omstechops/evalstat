@@ -100,14 +100,18 @@ each fails; `help(paired_bootstrap)` is the short version.
 
 ## Development
 
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+The virtualenv is not in the repository; recreate it after a clone. The
+interpreter has to satisfy `requires-python = ">=3.12"`, and a bare `python3`
+is often older than that.
 
-pytest -q
-ruff check . && ruff format .
-mypy
+```bash
+python3.12 -m venv .venv          # or any newer 3.x
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/pytest -q && .venv/bin/ruff check . && .venv/bin/mypy
 ```
+
+The coverage simulations are marked `slow` and excluded from nothing; they take
+minutes. Run them on their own with `.venv/bin/pytest -m slow`.
 
 ## License
 
