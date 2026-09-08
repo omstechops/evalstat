@@ -223,6 +223,32 @@ class PowerAnalysisResult:
     curve: PowerCurve | None
 
 
+def _as_design(
+    items_per_cluster: float | ArrayLike,
+    rho: float | ArrayLike,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Validate a cluster size and an intra-cluster correlation together.
+
+    Shared by both helpers so that the two cannot drift into disagreeing about
+    what they accept.
+    """
+    m = np.asarray(items_per_cluster, dtype=np.float64)
+    r = np.asarray(rho, dtype=np.float64)
+    if not np.all(np.isfinite(m)) or np.any(m < 1.0):
+        raise ValueError(
+            f"items_per_cluster must be finite and at least 1, got "
+            f"{items_per_cluster!r}"
+        )
+    if not np.all(np.isfinite(r)) or np.any(r < 0.0) or np.any(r >= 1.0):
+        raise ValueError(
+            f"rho must lie in [0, 1), got {rho!r}. At rho = 1 the items of a "
+            "cluster are copies of one another and the effective sample is the "
+            "cluster count itself -- that is a design with one item per "
+            "cluster, and saying so is clearer than deriving it here"
+        )
+    return m, r
+
+
 def design_effect(
     items_per_cluster: float | ArrayLike,
     rho: float | ArrayLike,
@@ -247,8 +273,17 @@ def design_effect(
         Broadcast over both arguments. Exactly ``1.0`` at ``rho = 0``, so the
         unclustered case passes through this function unchanged rather than
         around it.
+
+    Raises
+    ------
+    ValueError
+        If ``items_per_cluster`` is below 1, or ``rho`` is outside ``[0, 1)``.
     """
-    raise NotImplementedError
+    m, r = _as_design(items_per_cluster, rho)
+    # Written so that rho = 0 and m = 1 both give exactly 1.0 rather than
+    # something that rounds to it: (m - 1) * 0 and 0 * r are both exact.
+    inflation: NDArray[np.float64] = 1.0 + (m - 1.0) * r
+    return inflation
 
 
 def effective_n(
@@ -276,8 +311,23 @@ def effective_n(
     numpy.ndarray
         Broadcast over the arguments. Bounded above by ``n_clusters / rho`` for
         every ``items_per_cluster``.
+
+    Raises
+    ------
+    ValueError
+        If ``n_clusters`` is below 2, ``items_per_cluster`` is below 1, or
+        ``rho`` is outside ``[0, 1)``.
     """
-    raise NotImplementedError
+    m, r = _as_design(items_per_cluster, rho)
+    k = np.asarray(n_clusters, dtype=np.float64)
+    if not np.all(np.isfinite(k)) or np.any(k < 2.0):
+        raise ValueError(
+            f"n_clusters must be finite and at least 2, got {n_clusters!r}; "
+            "a single cluster carries no information about variation between "
+            "clusters, which is the variation this correction is about"
+        )
+    n_eff: NDArray[np.float64] = k * m / (1.0 + (m - 1.0) * r)
+    return n_eff
 
 
 def power_analysis(
