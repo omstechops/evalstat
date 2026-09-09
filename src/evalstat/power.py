@@ -114,6 +114,8 @@ nothing downstream could tell the two apart.
 
 from __future__ import annotations
 
+import math
+import secrets
 import warnings
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -123,7 +125,7 @@ from numpy.typing import ArrayLike, NDArray
 from scipy.optimize import brentq
 from scipy.stats import norm
 
-from evalstat.bootstrap import MIN_CLUSTERS, FewClustersWarning
+from evalstat.bootstrap import MIN_CLUSTERS, FewClustersWarning, paired_bootstrap
 
 __all__ = [
     "AnalyticProportionWarning",
@@ -587,6 +589,226 @@ def _slot_message(slots: dict[str, float | None], missing: list[str]) -> str:
     )
 
 
+# The mean's grid is symmetric and odd-length so that the null sits on a grid
+# point exactly rather than near one; the rate's grid is the set of points
+# actually simulated, so it is kept short.
+_SIM_GRID_POINTS = 41
+_RATE_GRID_POINTS = 9
+_MAX_BISECTIONS = 200
+
+
+def _preference_rate(d: NDArray[np.float64]) -> float:
+    """Share of non-tied items favouring the first system; NaN when all tied.
+
+    The same definition :func:`power_analysis` documents and
+    :mod:`evalstat.bootstrap`'s tests use. Ties leave the denominator; they are
+    not counted as half a win, because an abstention is not half a preference.
+    """
+    decided = int(np.count_nonzero(d != 0.0))
+    if decided == 0:
+        return float("nan")
+    return float(np.count_nonzero(d > 0.0)) / decided
+
+
+def _cluster_labels(n_clusters: int, items_per_cluster: int) -> NDArray[np.intp]:
+    """Contiguous cluster labels, one per item."""
+    return np.repeat(np.arange(n_clusters), items_per_cluster).astype(np.intp)
+
+
+def _draw_mean_differences(
+    generator: np.random.Generator,
+    n_clusters: int,
+    items_per_cluster: int,
+    rho: float,
+    sd: float,
+) -> NDArray[np.float64]:
+    """Paired differences at a zero effect, total sd ``sd``, correlation ``rho``.
+
+    ``d_ij = a_i + e_ij`` with ``var(a) = sd**2 * rho`` and
+    ``var(e) = sd**2 * (1 - rho)``. This is the generator
+    ``tests/test_bootstrap.py`` measures coverage with, at ``mu = 0``, so the
+    power computed here and the coverage measured there describe one kind of
+    data rather than two.
+    """
+    between = generator.normal(0.0, sd * math.sqrt(rho), size=n_clusters)
+    within = generator.normal(
+        0.0, sd * math.sqrt(1.0 - rho), size=(n_clusters, items_per_cluster)
+    )
+    drawn: NDArray[np.float64] = (between[:, None] + within).ravel()
+    return drawn
+
+
+def _draw_preferences(
+    generator: np.random.Generator,
+    n_clusters: int,
+    items_per_cluster: int,
+    rho: float,
+    rate: float,
+    tie_rate: float,
+) -> NDArray[np.float64]:
+    """Clustered preferences as -1, 0, +1 with marginal win rate ``rate``.
+
+    A latent normal carries the clustering: ``var(a) = rho`` and
+    ``var(e) = 1 - rho`` give it unit variance, so it crosses zero with
+    probability ``Phi(mu)`` and ``mu = Phi^-1(rate)`` hits the requested rate
+    exactly. Ties are drawn independently at ``tie_rate``, which is assumption 8
+    of :func:`power_analysis` and not a claim about raters: real ties cluster,
+    and a design whose conclusion turns on that should not read it off this
+    generator.
+    """
+    mu = float(norm.ppf(rate))
+    between = generator.normal(0.0, math.sqrt(rho), size=n_clusters)
+    within = generator.normal(
+        0.0, math.sqrt(1.0 - rho), size=(n_clusters, items_per_cluster)
+    )
+    decided = np.where(mu + between[:, None] + within > 0.0, 1.0, -1.0)
+    if tie_rate > 0.0:
+        tied = generator.random((n_clusters, items_per_cluster)) < tie_rate
+        decided = np.where(tied, 0.0, decided)
+    drawn: NDArray[np.float64] = decided.ravel().astype(np.float64)
+    return drawn
+
+
+def _mean_interval_bounds(
+    generator: np.random.Generator,
+    n_clusters: int,
+    items_per_cluster: int,
+    rho: float,
+    sd: float,
+    n_sim: int,
+    n_resamples: int,
+    confidence_level: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Interval endpoints for ``n_sim`` datasets drawn at a zero effect.
+
+    Only the endpoints are kept because for the mean they are the whole power
+    curve. Adding ``delta`` to every difference shifts the estimate and every
+    resampled mean by ``delta``, so the interval becomes ``[lo + delta,
+    hi + delta]`` exactly, and one run per dataset answers every effect.
+    """
+    labels = _cluster_labels(n_clusters, items_per_cluster)
+    low = np.empty(n_sim, dtype=np.float64)
+    high = np.empty(n_sim, dtype=np.float64)
+    with warnings.catch_warnings():
+        # power_analysis has already warned once for this design; n_sim further
+        # copies of the same sentence carry no information the first did not.
+        warnings.simplefilter("ignore", FewClustersWarning)
+        for i in range(n_sim):
+            diff = _draw_mean_differences(
+                generator, n_clusters, items_per_cluster, rho, sd
+            )
+            interval = paired_bootstrap(
+                diff,
+                cluster=labels,
+                n_resamples=n_resamples,
+                confidence_level=confidence_level,
+                rng=generator,
+            )
+            low[i] = interval.ci_low
+            high[i] = interval.ci_high
+    return low, high
+
+
+def _mean_rejection(
+    low: NDArray[np.float64], high: NDArray[np.float64], effect: float
+) -> float:
+    """Share of the simulated intervals that exclude zero at ``effect``."""
+    return float(np.mean((low + effect > 0.0) | (high + effect < 0.0)))
+
+
+def _mean_rejection_curve(
+    low: NDArray[np.float64], high: NDArray[np.float64], grid: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """:func:`_mean_rejection` over a whole grid, without re-resampling."""
+    shifted_low = low[None, :] + grid[:, None]
+    shifted_high = high[None, :] + grid[:, None]
+    rate: NDArray[np.float64] = np.mean(
+        (shifted_low > 0.0) | (shifted_high < 0.0), axis=1, dtype=np.float64
+    )
+    return rate
+
+
+def _solve_mean_mde(
+    low: NDArray[np.float64], high: NDArray[np.float64], target: float
+) -> float:
+    """Smallest effect whose empirical rejection rate reaches ``target``.
+
+    Bisection rather than :func:`scipy.optimize.brentq`, and the difference is
+    not a preference. The empirical curve is a step function with one jump per
+    simulated dataset; brentq interpolates towards a continuous crossing that
+    does not exist here, while bisection converges on the jump, which is the
+    answer. The bracket is derived rather than searched: at ``-min(lo)`` every
+    simulated interval has been shifted clear of zero, so the rate is one there,
+    and at zero it is the design's own error rate.
+
+    Raises
+    ------
+    RuntimeError
+        If the bracket cannot be established -- the rate fails to reach the
+        target even where every interval has cleared zero. Nothing is returned
+        in that case.
+    """
+    if _mean_rejection(low, high, 0.0) >= target:
+        # The design already rejects this often under the null. Reporting a
+        # positive MDE would describe detection that is not detection.
+        return 0.0
+    ceiling = float(-np.min(low)) * (1.0 + 1e-9) + 1e-12
+    if ceiling <= 0.0 or _mean_rejection(low, high, ceiling) < target:
+        raise RuntimeError(
+            f"the simulated rejection rate never reaches {target}: at the "
+            f"effect where every simulated interval has cleared zero it is "
+            f"{_mean_rejection(low, high, max(ceiling, 0.0))}. This is a bug in "
+            "the bracketing rather than a property of the design"
+        )
+    lower, upper = 0.0, ceiling
+    for _ in range(_MAX_BISECTIONS):
+        middle = 0.5 * (lower + upper)
+        if _mean_rejection(low, high, middle) >= target:
+            upper = middle
+        else:
+            lower = middle
+        if upper - lower <= 1e-12 * max(1.0, upper):
+            break
+    return upper
+
+
+def _rate_rejection(
+    generator: np.random.Generator,
+    n_clusters: int,
+    items_per_cluster: int,
+    rho: float,
+    rate: float,
+    tie_rate: float,
+    n_sim: int,
+    n_resamples: int,
+    confidence_level: float,
+) -> float:
+    """Share of simulated intervals excluding the null rate of 0.5.
+
+    A rate is not equivariant under a location shift -- moving it changes its
+    variance and its tie structure -- so this is paid for once per grid point
+    rather than recovered from a single run.
+    """
+    labels = _cluster_labels(n_clusters, items_per_cluster)
+    rejected = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FewClustersWarning)
+        for _ in range(n_sim):
+            diff = _draw_preferences(
+                generator, n_clusters, items_per_cluster, rho, rate, tie_rate
+            )
+            interval = paired_bootstrap(
+                diff,
+                cluster=labels,
+                statistic=_preference_rate,
+                n_resamples=n_resamples,
+                confidence_level=confidence_level,
+                rng=generator,
+            )
+            rejected += int(interval.ci_low > 0.5 or interval.ci_high < 0.5)
+    return rejected / n_sim
+
+
 def power_analysis(
     *,
     statistic: Statistic = "mean",
@@ -870,12 +1092,202 @@ def power_analysis(
     if items_per_cluster is not None:
         _as_design(items_per_cluster, rho_arr)
 
+    ones = np.ones_like(rho_arr)
+
     if method == "simulation":
-        raise NotImplementedError(
-            "the simulation route is not implemented yet. Pass "
-            "method='analytic' for the normal approximation, reading the "
-            "module docstring for what that route assumes about the interval "
-            "procedure's error rate"
+        if alternative != "two-sided":
+            raise NotImplementedError(
+                f"the simulation route runs the two-sided interval rule only, "
+                f"got alternative={alternative!r}. paired_bootstrap returns a "
+                "two-sided interval, and turning it into a one-sided test at "
+                "this alpha means deciding which interval to build it from -- a "
+                "choice about the test, not about this code, and one nothing "
+                "here has tested. Use method='analytic' for a one-sided figure"
+            )
+        if solved_for in ("n_clusters", "items_per_cluster"):
+            raise NotImplementedError(
+                f"the simulation route solves for effect or power, not for "
+                f"{solved_for}. Solving for a design quantity means simulating "
+                "at each candidate design and searching over them, so the cost "
+                "is one full simulation per step rather than one in total, and "
+                "no shortcut like the mean's location-equivariance applies. Use "
+                "method='analytic' to size the design, then check the design it "
+                "returns with a simulation run"
+            )
+        assert n_clusters is not None and items_per_cluster is not None
+        if float(items_per_cluster) != int(items_per_cluster):
+            raise ValueError(
+                f"the simulation route needs a whole number of items per "
+                f"cluster to generate, got {items_per_cluster!r}. m_bar is a "
+                "variance-weighted mean and may be fractional on the analytic "
+                "route, where it enters only through the design effect; here it "
+                "is a count of items to draw"
+            )
+
+        if isinstance(rng, np.random.Generator):
+            generator, seed = rng, None
+        else:
+            seed = secrets.randbits(64) if rng is None else int(rng)
+            generator = np.random.default_rng(seed)
+
+        clusters = int(n_clusters)
+        items = int(items_per_cluster)
+        confidence_level = 1.0 - alpha
+        m_arr = ones * float(items)
+        k_arr = ones * float(clusters)
+        de = 1.0 + (m_arr - 1.0) * rho_arr
+        n_eff = k_arr * m_arr / de
+
+        if clusters < MIN_CLUSTERS:
+            warnings.warn(
+                f"{clusters} clusters is below {MIN_CLUSTERS}; the cluster "
+                "bootstrap being simulated under-covers at that count, so it "
+                "rejects more often than alpha. The simulation measures that "
+                "rather than assuming it away -- read coverage_measured beside "
+                "the power",
+                FewClustersWarning,
+                stacklevel=2,
+            )
+
+        power_arr = np.empty_like(rho_arr)
+        effect_arr = np.empty_like(rho_arr)
+        measured = np.empty_like(rho_arr)
+
+        if statistic == "mean":
+            assert sd is not None  # guaranteed by validation above
+            bounds = [
+                _mean_interval_bounds(
+                    generator,
+                    clusters,
+                    items,
+                    float(r),
+                    sd,
+                    n_sim,
+                    n_resamples,
+                    confidence_level,
+                )
+                for r in rho_arr
+            ]
+            for j, (low, high) in enumerate(bounds):
+                # The zero point of the same run: the rejection rate under the
+                # null is this design's real error rate, so its complement is
+                # the coverage. Measured at the design being asked about, not
+                # carried to it from another one.
+                measured[j] = 1.0 - _mean_rejection(low, high, 0.0)
+                if solved_for == "effect":
+                    assert power is not None  # guaranteed by the slot check
+                    effect_arr[j] = _solve_mean_mde(low, high, power)
+                    power_arr[j] = power
+                else:
+                    assert effect is not None  # guaranteed by the slot check
+                    effect_arr[j] = effect
+                    power_arr[j] = _mean_rejection(low, high, effect)
+
+            span = float(np.max(np.abs(effect_arr))) * 1.5
+            grid = np.linspace(-span, span, _SIM_GRID_POINTS)
+            grid[_SIM_GRID_POINTS // 2] = 0.0  # the null, exactly on a point
+            curve_power = np.vstack(
+                [_mean_rejection_curve(low, high, grid) for low, high in bounds]
+            )
+        else:
+            if solved_for == "effect":
+                assert power is not None  # guaranteed by the slot check
+                # For a rate the grid is where the simulations happen, so it is
+                # fixed before any of them run. The analytic MDE sets the scale
+                # and is known to be optimistic, hence the headroom above it.
+                lam_req = _required_lambda(power, alpha, alternative)
+                analytic = _effect_of(
+                    lam_req,
+                    n_eff,
+                    statistic,
+                    sd,
+                    tie_rate,
+                    variance_under,
+                    alternative,
+                )
+                top = min(0.5 + 1.8 * (float(np.max(analytic)) - 0.5), 0.999)
+                grid = np.linspace(0.5, top, _RATE_GRID_POINTS)
+            else:
+                assert effect is not None  # guaranteed by the slot check
+                # Two points: the null, which measures coverage, and the rate
+                # asked about. A denser grid would be simulation nobody asked
+                # for -- the solution is read off one point, not a curve.
+                grid = np.array([0.5, float(effect)], dtype=np.float64)
+
+            curve_power = np.vstack(
+                [
+                    [
+                        _rate_rejection(
+                            generator,
+                            clusters,
+                            items,
+                            float(r),
+                            float(point),
+                            tie_rate,
+                            n_sim,
+                            n_resamples,
+                            confidence_level,
+                        )
+                        for point in grid
+                    ]
+                    for r in rho_arr
+                ]
+            )
+            for j in range(rho_arr.size):
+                measured[j] = 1.0 - curve_power[j, 0]
+                if solved_for == "effect":
+                    assert power is not None  # guaranteed by the slot check
+                    # Monotone in the rate up to Monte Carlo noise; the running
+                    # maximum imposes that so the read-off cannot go backwards
+                    # on a wiggle, which np.interp would otherwise let it do.
+                    rising = np.maximum.accumulate(curve_power[j])
+                    if rising[-1] < power:
+                        raise RuntimeError(
+                            f"the simulated rejection rate reaches only "
+                            f"{rising[-1]} at a rate of {grid[-1]}, short of "
+                            f"the requested {power}; the grid this MDE would be "
+                            "read off does not contain the answer"
+                        )
+                    effect_arr[j] = float(np.interp(power, rising, grid))
+                    power_arr[j] = power
+                else:
+                    assert effect is not None  # guaranteed by the slot check
+                    effect_arr[j] = float(effect)
+                    power_arr[j] = curve_power[j, -1]
+
+        mc_se = np.sqrt(power_arr * (1.0 - power_arr) / n_sim)
+        with np.errstate(divide="ignore"):
+            ceiling = np.where(rho_arr > 0.0, k_arr / rho_arr, np.inf)
+        return PowerAnalysisResult(
+            solved_for=solved_for,
+            statistic=statistic,
+            effect=effect_arr,
+            power=power_arr,
+            n_clusters=k_arr,
+            items_per_cluster=m_arr,
+            n_items=k_arr * m_arr,
+            n_eff=n_eff,
+            design_effect=de,
+            n_eff_ceiling=ceiling,
+            rho=rho_arr,
+            sd=sd,
+            tie_rate=tie_rate,
+            alpha=alpha,
+            alternative=alternative,
+            variance_under=variance_under,
+            coverage=None,
+            coverage_measured=measured,
+            coverage_source="measured",
+            method=method,
+            n_sim=n_sim,
+            n_resamples=n_resamples,
+            mc_se=mc_se,
+            seed=seed,
+            curve=PowerCurve(
+                effect=grid,
+                power=curve_power,
+                mc_se=np.sqrt(curve_power * (1.0 - curve_power) / n_sim),
+            ),
         )
 
     if statistic == "preference_rate":
@@ -896,7 +1308,6 @@ def power_analysis(
         "nominal" if coverage is None else "supplied"
     )
     z_crit = _z_crit(alpha_eff, alternative)
-    ones = np.ones_like(rho_arr)
 
     if solved_for == "power":
         assert effect is not None  # guaranteed by the slot check

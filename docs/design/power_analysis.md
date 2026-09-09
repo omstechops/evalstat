@@ -1,7 +1,8 @@
 # Design note — `power_analysis()`
 
-**Status:** design settled, signature and docstring written, implementation
-pending. Tests are written before the body.
+**Status:** implemented, both routes. The analytic route landed first, the
+simulation route after it, and the tests were written before either. Three gaps
+in the simulation route are deliberate and recorded in section 4.
 
 This note is the decision record. It says what was decided and why, and what is
 still open. It does **not** repeat the assumption list: that lives in the
@@ -98,6 +99,28 @@ so coverage is measured for free and reported on the result.
 
 A preference rate is not location-equivariant and its grid is evaluated point by
 point.
+
+### Known gaps in the simulation route
+
+Three calls the analytic route answers raise `NotImplementedError` on the
+simulation route. All three are deliberate, none is needed by the study this
+package was built for, and each error message names the analytic route. They are
+written down here so that a later reader can tell a decision from an oversight.
+
+| | Gap | Why it is open | What closing it needs |
+|---|---|---|---|
+| G1 | one-sided `alternative` | `paired_bootstrap` returns a two-sided interval. Turning it into a one-sided test at `alpha` means deciding which interval to build it from — `confidence_level = 1 - 2*alpha` is the standard correspondence, but that is a choice about the test, and D2 eliminated one-sided testing for this study anyway. | A decision on the correspondence, and a test pinning it. Two lines of code after that. |
+| G2 | solving `n_clusters` | Each candidate design needs its own simulation, so a search costs one full run per step instead of one in total. The mean's location-equivariance does not help: it moves the effect, not the sample size. | A decision on the search budget, and whether an unconverged search reports or raises. |
+| G3 | solving `items_per_cluster` | Same as G2. | Same as G2. |
+
+The intended workflow while they are open is the one the error messages state:
+size the design on the analytic route, then check the design it returns with a
+simulation run. That is also the better order — the analytic answer is the
+cheap one and the simulation is the one that measures the procedure.
+
+**These are route gaps, not scope exclusions.** Section 2's "out, deliberately"
+list is about things this function will not do at all; these three are things it
+does on one route and not yet on the other.
 
 ## 5. The coverage shortfall
 
