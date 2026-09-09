@@ -153,6 +153,34 @@ def test_an_unreachable_target_names_the_ceiling() -> None:
         )
 
 
+def test_a_design_that_already_reaches_the_target_asks_for_one_item() -> None:
+    """The other end of the item solve: clamped at 1, not a fraction of an item.
+
+    Four hundred clusters detect an effect of 0.5 long before the second item
+    of a cluster is rated, so the unclamped arithmetic returns something below
+    one. Two-thirds of an item is not a design, and returning it would put a
+    number in a plan that cannot be collected. The clamp is pinned here because
+    it is a silent behaviour: it changes an answer rather than raising, so a
+    regression in it would not announce itself.
+    """
+    result = power_analysis(
+        effect=0.5,
+        sd=1.0,
+        n_clusters=400,
+        items_per_cluster=None,
+        rho=0.2,
+        power=0.80,
+        method="analytic",
+    )
+    assert result.solved_for == "items_per_cluster"
+    assert float(result.items_per_cluster[0]) == 1.0
+    assert float(result.n_eff[0]) == pytest.approx(400.0)
+    # Clamped, not solved: the design overshoots the power it was asked for,
+    # and the reported power is the one this design has rather than the target
+    # handed back unchanged. Otherwise the four fields describe two designs.
+    assert float(result.power[0]) > 0.80
+
+
 # --------------------------------------------------------------------------
 # R4  the two directions invert each other
 # --------------------------------------------------------------------------
@@ -433,16 +461,29 @@ def test_the_analytic_route_warns_for_a_preference_rate() -> None:
 
 
 def test_power_rises_with_clusters_and_effect_and_falls_with_rho() -> None:
+    """Monotonicity in each of the three, holding the other two fixed.
+
+    ``k = 20`` is below MIN_CLUSTERS and the FewClustersWarning it raises is
+    suppressed on purpose: twenty clusters is a design people will actually
+    run, and the claim under test is that power is ordered across the range,
+    not that a warning is or is not present. The warning has its own tests --
+    ``test_few_clusters_warns`` and ``test_the_threshold_itself_does_not_warn``
+    -- and suppressing it here does not weaken them. Without the suppression
+    the ``filterwarnings = ["error"]`` setting turns it into a failure of a
+    test that is not about warnings at all.
+    """
     base: dict[str, Any] = {
         "sd": 1.0,
         "items_per_cluster": 3,
         "power": None,
         "method": "analytic",
     }
-    by_clusters = [
-        float(power_analysis(effect=0.3, n_clusters=k, rho=0.2, **base).power[0])
-        for k in (20, 40, 80)
-    ]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FewClustersWarning)
+        by_clusters = [
+            float(power_analysis(effect=0.3, n_clusters=k, rho=0.2, **base).power[0])
+            for k in (20, 40, 80)
+        ]
     by_effect = [
         float(power_analysis(effect=d, n_clusters=40, rho=0.2, **base).power[0])
         for d in (0.1, 0.3, 0.5)
