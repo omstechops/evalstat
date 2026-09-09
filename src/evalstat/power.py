@@ -69,15 +69,61 @@ free and reported on the result.
 
 A preference rate is not location-equivariant and gets no such discount: its
 grid is evaluated point by point.
+
+How the inversion is done, and how it can fail
+----------------------------------------------
+Solving for an effect, for clusters, or for items per cluster all reduce to one
+one-dimensional root-find, and it is on none of those three. Write ``lam`` for
+the effect divided by its own standard error. The rejection probability of the
+normal test depends on the design *only* through ``lam``, so inverting the power
+function once -- for the ``lam`` at which the test reaches the requested power
+-- leaves every remaining step a closed form:
+
+.. code-block:: text
+
+    MDE            effect = lam * sd / sqrt(n_eff)
+    clusters       n_eff  = (lam * sd / effect) ** 2,  k = n_eff * DE / m_bar
+    items          m_bar  = n_eff * (1 - rho) / (k - n_eff * rho)
+
+The last line is the ceiling of the opening section written out as arithmetic:
+its denominator vanishes at ``n_eff = k / rho``, and past that point no item
+count solves it at all. That is checked before the division rather than after,
+so the impossible request raises with the ceiling's value instead of returning
+an enormous number or an infinity.
+
+``lam`` is where :func:`scipy.optimize.brentq` is used, on the bracket
+``[0, z_crit + z_power]``. Neither end is searched for; both are known before
+the call. At ``lam = 0`` the power is exactly the test's level, which lies below
+any target this function accepts -- a target at or below ``alpha`` is refused
+earlier, on the ground that an effect of zero already reaches it. The upper end
+is the textbook one-sided sample-size solution, which a two-sided test overshoots
+by the far-tail term ``Phi(-lam - z_crit)``, a strictly positive quantity, so the
+root is bracketed from both sides by construction. For a one-sided alternative
+that upper end *is* the root and brentq returns it directly. Only if
+floating-point evaluation leaves the upper end a hair on the wrong side is it
+doubled, and then at most sixty times.
+
+**Non-convergence is not silent.** brentq is called with ``full_output=True``
+and its ``converged`` flag is checked; a bracket that cannot be established, or
+a run that exhausts its iterations, raises :class:`RuntimeError` naming the
+target power, the level, and the alternative it was solving at. There is no
+fallback value, no best-effort return and no warning-and-continue: a power
+figure that quietly came back unconverged would be worse than no figure, because
+nothing downstream could tell the two apart.
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from scipy.optimize import brentq
+from scipy.stats import norm
+
+from evalstat.bootstrap import MIN_CLUSTERS, FewClustersWarning
 
 __all__ = [
     "AnalyticProportionWarning",
@@ -153,7 +199,9 @@ class PowerAnalysisResult:
         The four solvable quantities, three as supplied and one as solved.
         ``n_clusters`` is **not rounded**: it is the real-valued solution, and
         rounding it is a decision about which side of the target to land on
-        that this function does not make silently.
+        that this function does not make silently. ``power`` is the requested
+        target except where solving for ``items_per_cluster`` hit the clamp at
+        one item, in which case it is the power the returned design has.
     n_items
         ``n_clusters * items_per_cluster``, the rating load.
     n_eff
@@ -233,12 +281,22 @@ def _as_design(
     what they accept.
     """
     m = np.asarray(items_per_cluster, dtype=np.float64)
-    r = np.asarray(rho, dtype=np.float64)
     if not np.all(np.isfinite(m)) or np.any(m < 1.0):
         raise ValueError(
             f"items_per_cluster must be finite and at least 1, got "
             f"{items_per_cluster!r}"
         )
+    return m, _as_rho(rho)
+
+
+def _as_rho(rho: float | ArrayLike) -> NDArray[np.float64]:
+    """Validate an intra-cluster correlation on its own.
+
+    Split out of :func:`_as_design` because ``power_analysis`` has to check
+    ``rho`` even in the call where ``items_per_cluster`` is the argument being
+    solved for and there is no cluster size to check it beside.
+    """
+    r = np.asarray(rho, dtype=np.float64)
     if not np.all(np.isfinite(r)) or np.any(r < 0.0) or np.any(r >= 1.0):
         raise ValueError(
             f"rho must lie in [0, 1), got {rho!r}. At rho = 1 the items of a "
@@ -246,7 +304,7 @@ def _as_design(
             "cluster count itself -- that is a design with one item per "
             "cluster, and saying so is clearer than deriving it here"
         )
-    return m, r
+    return r
 
 
 def design_effect(
@@ -330,6 +388,205 @@ def effective_n(
     return n_eff
 
 
+# brentq is given a bracket whose ends are derived rather than searched for, so
+# these govern only the final polish; see the module docstring.
+_BRENTQ_XTOL = 1e-13
+_BRENTQ_RTOL = 4.0 * float(np.finfo(np.float64).eps)
+_BRENTQ_MAXITER = 200
+_MAX_BRACKET_DOUBLINGS = 60
+
+
+def _z_crit(alpha: float, alternative: Alternative) -> float:
+    """Critical value of the standard normal for a test at this level."""
+    tail = alpha / 2.0 if alternative == "two-sided" else alpha
+    return float(norm.ppf(1.0 - tail))
+
+
+def _power_from_lambda(
+    lam: NDArray[np.float64] | float,
+    z_crit: float,
+    alternative: Alternative,
+) -> NDArray[np.float64]:
+    """Rejection probability at signed noncentrality ``lam``.
+
+    ``lam`` is the effect divided by its own standard error and carries the
+    effect's sign, so ``lam = 0`` returns the test's level exactly and an effect
+    pointing against a one-sided alternative returns less than it.
+    """
+    lam_arr = np.asarray(lam, dtype=np.float64)
+    if alternative == "greater":
+        power = norm.cdf(lam_arr - z_crit)
+    elif alternative == "less":
+        power = norm.cdf(-lam_arr - z_crit)
+    else:
+        power = norm.cdf(lam_arr - z_crit) + norm.cdf(-lam_arr - z_crit)
+    return np.asarray(power, dtype=np.float64)
+
+
+def _required_lambda(
+    target_power: float, alpha: float, alternative: Alternative
+) -> float:
+    """Invert the power function: the noncentrality that reaches ``target_power``.
+
+    The only root-find in the module. Bracket, guarantees and failure behaviour
+    are described in the module docstring; the short version is that the lower
+    end is ``0``, where the power is exactly ``alpha``, and the upper end is the
+    one-sided closed form ``z_crit + z_power``, which a two-sided test passes.
+    """
+    z_crit = _z_crit(alpha, alternative)
+
+    def shortfall(lam: float) -> float:
+        return float(_power_from_lambda(lam, z_crit, alternative)) - target_power
+
+    high = z_crit + float(norm.ppf(target_power))
+    doublings = 0
+    while shortfall(high) < 0.0 and doublings < _MAX_BRACKET_DOUBLINGS:
+        # Reached only when the closed-form end lands a rounding error short of
+        # the target, which happens for a one-sided alternative where that end
+        # is the root itself. The additive term carries a high of exactly zero.
+        high = 2.0 * high + 1e-12
+        doublings += 1
+    if shortfall(high) < 0.0:
+        raise RuntimeError(
+            f"could not bracket the noncentrality reaching power "
+            f"{target_power} at alpha={alpha}, alternative={alternative!r}: "
+            f"the power is still below target at lambda={high}. This is a bug "
+            "in the bracketing, not a property of the design"
+        )
+
+    root, results = brentq(
+        shortfall,
+        0.0,
+        high,
+        xtol=_BRENTQ_XTOL,
+        rtol=_BRENTQ_RTOL,
+        maxiter=_BRENTQ_MAXITER,
+        full_output=True,
+    )
+    if not results.converged:
+        raise RuntimeError(
+            f"root-finding for power {target_power} at alpha={alpha}, "
+            f"alternative={alternative!r} did not converge in "
+            f"{_BRENTQ_MAXITER} iterations ({results.flag}); no value is "
+            "returned, because an unconverged power figure is not "
+            "distinguishable downstream from a converged one"
+        )
+    return float(root)
+
+
+def _informative_n(
+    n_eff: NDArray[np.float64], statistic: Statistic, tie_rate: float
+) -> NDArray[np.float64]:
+    """Effective sample carrying information about the statistic.
+
+    Ties are removed from the *effective* sample, not from the nominal item
+    count: the clustering discount applies first and the tie discount applies to
+    what survives it. Applying ``(1 - tie_rate)`` to the item count instead
+    would credit the design with information the clustering already spent.
+    """
+    if statistic == "mean":
+        return n_eff
+    return n_eff * (1.0 - tie_rate)
+
+
+def _lambda_of(
+    effect: float,
+    n_eff: NDArray[np.float64],
+    statistic: Statistic,
+    sd: float | None,
+    tie_rate: float,
+    variance_under: Literal["null", "alternative"],
+) -> NDArray[np.float64]:
+    """Signed noncentrality of ``effect`` at this design.
+
+    Written as a multiplication by ``sqrt(n)`` rather than a division by a
+    standard error so that a zero sample gives a zero noncentrality instead of
+    a division by zero.
+    """
+    n_info = _informative_n(n_eff, statistic, tie_rate)
+    if statistic == "mean":
+        assert sd is not None  # guaranteed by validation above
+        return (effect / sd) * np.sqrt(n_info)
+    variance = 0.25 if variance_under == "null" else effect * (1.0 - effect)
+    return (effect - 0.5) * np.sqrt(n_info / variance)
+
+
+def _effect_of(
+    lam: float,
+    n_eff: NDArray[np.float64],
+    statistic: Statistic,
+    sd: float | None,
+    tie_rate: float,
+    variance_under: Literal["null", "alternative"],
+    alternative: Alternative,
+) -> NDArray[np.float64]:
+    """Smallest detectable effect at noncentrality ``lam``.
+
+    Returned on the side the alternative can detect: negative, or below the
+    null rate of 0.5, for ``less``; positive, or above 0.5, otherwise.
+    """
+    n_info = _informative_n(n_eff, statistic, tie_rate)
+    sign = -1.0 if alternative == "less" else 1.0
+    if statistic == "mean":
+        assert sd is not None  # guaranteed by validation above
+        return sign * lam * sd / np.sqrt(n_info)
+    if variance_under == "null":
+        return 0.5 + sign * lam * 0.5 / np.sqrt(n_info)
+    # Solving u = lam * sqrt(p (1 - p) / n) with u = p - 0.5, so that
+    # p (1 - p) = 0.25 - u**2, gives u**2 (1 + c) = 0.25 c for c = lam**2 / n.
+    c = lam**2 / n_info
+    return 0.5 + sign * 0.5 * np.sqrt(c / (1.0 + c))
+
+
+def _required_n_eff(
+    lam: float,
+    effect: float,
+    statistic: Statistic,
+    sd: float | None,
+    tie_rate: float,
+    variance_under: Literal["null", "alternative"],
+) -> float:
+    """Effective sample at which ``effect`` reaches noncentrality ``lam``.
+
+    The inverse of :func:`_lambda_of` in its sample-size argument. Scalar: it
+    depends on the effect and the statistic, and not on how the clustering
+    arrived at the effective sample, which is why one value serves a whole
+    ``rho`` range.
+    """
+    if statistic == "mean":
+        assert sd is not None  # guaranteed by validation above
+        return float((lam * sd / abs(effect)) ** 2)
+    variance = 0.25 if variance_under == "null" else effect * (1.0 - effect)
+    n_info = lam**2 * variance / (effect - 0.5) ** 2
+    return float(n_info / (1.0 - tie_rate))
+
+
+def _slot_message(slots: dict[str, float | None], missing: list[str]) -> str:
+    """Explain a wrong number of ``None`` slots, naming every slot by its state.
+
+    The four-slot signature is the one place this function can be got wrong
+    without noticing, so the message counts what was found rather than
+    restating the rule and leaving the caller to compare.
+    """
+    names = list(slots)
+    listed = ", ".join(names[:-1]) + f" and {names[-1]}"
+    supplied = ", ".join(f"{k}={v!r}" for k, v in slots.items() if v is not None)
+    if not missing:
+        return (
+            f"exactly one of {listed} must be None -- the one passed as None is "
+            f"the one solved for, and all four were supplied: {supplied}. Note "
+            "that power defaults to 0.80, so a call that never mentions power "
+            "still supplies it; pass power=None to solve for power"
+        )
+    return (
+        f"exactly one of {listed} must be None -- the one passed as None is the "
+        f"one solved for, and {len(missing)} were None: {', '.join(missing)}. "
+        + (f"Supplied: {supplied}. " if supplied else "Nothing else was supplied. ")
+        + "Solve for one at a time; to sweep a second quantity, call this "
+        "function once per value of it"
+    )
+
+
 def power_analysis(
     *,
     statistic: Statistic = "mean",
@@ -387,7 +644,12 @@ def power_analysis(
         ``m_bar``; see :func:`design_effect`. Solving for this is the request
         that can be impossible: past ``n_clusters / rho`` no item count reaches
         the target, and that is raised as an error naming the ceiling rather
-        than answered with a large number.
+        than answered with a large number. At the other end the answer is
+        clamped at 1: a design that already reaches the target with one item per
+        cluster needs one, and a fractional item count would be arithmetic
+        rather than a design. Where that clamp binds, the returned ``power`` is
+        the power the clamped design actually has, which is above the one
+        requested -- the four quantities always describe a single design.
     power
         Target rejection probability. Defaults to 0.80, which is a convention
         and not a finding; it is the threshold at which an MDE curve is read,
@@ -452,7 +714,14 @@ def power_analysis(
         ``[0, 1)``, or ``effect`` is zero. If ``sd`` is missing for ``mean`` or
         supplied for ``preference_rate``, or ``tie_rate`` supplied for ``mean``.
         If ``coverage`` is supplied on the simulation route. If solving for
-        ``items_per_cluster`` when the target exceeds ``n_clusters / rho``.
+        ``items_per_cluster`` when the target exceeds ``n_clusters / rho``. If
+        the target power does not exceed the level the test runs at, which an
+        effect of zero already reaches.
+    RuntimeError
+        If the root-find behind the inversion fails to converge or cannot be
+        bracketed. Nothing is returned in that case and no warning is issued in
+        place of the value; see the module docstring for the bracket and why
+        the failure is loud.
 
     Warns
     -----
@@ -508,4 +777,247 @@ def power_analysis(
     interval's level so that the real error rate equals ``alpha``, and reading
     the MDE off that, answers a different question and is not implemented.
     """
-    raise NotImplementedError
+    # The four-slot signature is checked before anything else: it is the one
+    # way to call this function wrongly that a reader cannot see in the call.
+    slots: dict[str, float | None] = {
+        "effect": effect,
+        "n_clusters": n_clusters,
+        "items_per_cluster": items_per_cluster,
+        "power": power,
+    }
+    missing = [name for name, value in slots.items() if value is None]
+    if len(missing) != 1:
+        raise ValueError(_slot_message(slots, missing))
+    solved_for = cast(Solvable, missing[0])
+
+    if statistic not in ("mean", "preference_rate"):
+        raise ValueError(f"unknown statistic {statistic!r}")
+    if method not in ("simulation", "analytic"):
+        raise ValueError(f"unknown method {method!r}")
+    if alternative not in ("two-sided", "less", "greater"):
+        raise ValueError(f"unknown alternative {alternative!r}")
+    if variance_under not in ("null", "alternative"):
+        raise ValueError(f"unknown variance_under {variance_under!r}")
+
+    rho_arr = np.atleast_1d(_as_rho(rho))
+    if not 0.0 < alpha < 1.0:
+        raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+    if power is not None and not 0.0 < power < 1.0:
+        raise ValueError(f"power must lie in (0, 1), got {power!r}")
+
+    if effect is not None:
+        if statistic == "mean":
+            if effect == 0.0 or not np.isfinite(effect):
+                raise ValueError(
+                    f"effect must be finite and non-zero, got {effect!r}. No "
+                    "sample size detects a difference of exactly zero: the "
+                    "power of the test against it is the level alpha itself"
+                )
+        elif not 0.0 < effect < 1.0 or effect == 0.5:
+            raise ValueError(
+                f"for preference_rate, effect is the rate itself and must lie "
+                f"in (0, 1) away from the null of 0.5, got {effect!r}"
+            )
+
+    if statistic == "mean":
+        if sd is None:
+            raise ValueError(
+                "sd is required for statistic='mean' and has no default: the "
+                "effect is measured in units of sd, so an assumed sd would "
+                "silently rescale the answer. Pass sd=1.0 to work in "
+                "standardised units"
+            )
+        if not np.isfinite(sd) or sd <= 0.0:
+            raise ValueError(f"sd must be finite and positive, got {sd!r}")
+        if tie_rate != 0.0:
+            raise ValueError(
+                f"tie_rate applies to preference_rate only, got {tie_rate!r} "
+                "for statistic='mean'. A mean has no ties to discard: a paired "
+                "difference of exactly zero is an observation, not an "
+                "abstention"
+            )
+    else:
+        if sd is not None:
+            raise ValueError(
+                f"sd applies to statistic='mean' only, got {sd!r} for "
+                "preference_rate, whose variance comes from the rate itself"
+            )
+        if not 0.0 <= tie_rate < 1.0:
+            raise ValueError(
+                f"tie_rate must lie in [0, 1), got {tie_rate!r}; at a tie rate "
+                "of 1 no item carries a preference and there is no design to "
+                "compute power for"
+            )
+
+    if coverage is not None:
+        if method == "simulation":
+            raise ValueError(
+                "coverage is for the analytic route only. The simulation route "
+                "measures the interval procedure's real coverage at this "
+                "design and reports it as coverage_measured; a supplied figure "
+                "would be a second and contradictory claim about the same "
+                "quantity"
+            )
+        if not 0.0 < coverage < 1.0:
+            raise ValueError(f"coverage must lie in (0, 1), got {coverage!r}")
+
+    if n_clusters is not None and (not np.isfinite(n_clusters) or n_clusters < 2):
+        raise ValueError(
+            f"n_clusters must be finite and at least 2, got {n_clusters!r}; "
+            "a single cluster carries no information about variation between "
+            "clusters, which is the variation this correction is about"
+        )
+    if items_per_cluster is not None:
+        _as_design(items_per_cluster, rho_arr)
+
+    if method == "simulation":
+        raise NotImplementedError(
+            "the simulation route is not implemented yet. Pass "
+            "method='analytic' for the normal approximation, reading the "
+            "module docstring for what that route assumes about the interval "
+            "procedure's error rate"
+        )
+
+    if statistic == "preference_rate":
+        warnings.warn(
+            "the analytic route treats the non-tied count as a fixed, known "
+            "quantity, when ties are counted from the same clustered data as "
+            "the preferences; the variance it uses is too small, so this power "
+            "is too high and this MDE too small",
+            AnalyticProportionWarning,
+            stacklevel=2,
+        )
+
+    # A supplied coverage replaces the nominal level outright rather than
+    # correcting it: 1 - coverage is the rate at which the procedure actually
+    # rejects, and that is the level the calculation should run at.
+    alpha_eff = alpha if coverage is None else 1.0 - coverage
+    coverage_source: Literal["nominal", "supplied", "measured"] = (
+        "nominal" if coverage is None else "supplied"
+    )
+    z_crit = _z_crit(alpha_eff, alternative)
+    ones = np.ones_like(rho_arr)
+
+    if solved_for == "power":
+        assert effect is not None  # guaranteed by the slot check
+        assert n_clusters is not None and items_per_cluster is not None
+        m_arr = ones * float(items_per_cluster)
+        k_arr = ones * float(n_clusters)
+        de = 1.0 + (m_arr - 1.0) * rho_arr
+        n_eff = k_arr * m_arr / de
+        lam = _lambda_of(effect, n_eff, statistic, sd, tie_rate, variance_under)
+        power_arr = _power_from_lambda(lam, z_crit, alternative)
+        effect_arr = ones * float(effect)
+    else:
+        assert power is not None  # guaranteed by the slot check
+        if power <= alpha_eff:
+            raise ValueError(
+                f"power must exceed the level the test runs at, {alpha_eff}, "
+                f"got {power}: an effect of zero is already declared "
+                "significant that often, so there is nothing to solve for"
+            )
+        lam_req = _required_lambda(power, alpha_eff, alternative)
+        power_arr = ones * float(power)
+
+        if solved_for == "effect":
+            assert n_clusters is not None and items_per_cluster is not None
+            m_arr = ones * float(items_per_cluster)
+            k_arr = ones * float(n_clusters)
+            de = 1.0 + (m_arr - 1.0) * rho_arr
+            n_eff = k_arr * m_arr / de
+            effect_arr = _effect_of(
+                lam_req, n_eff, statistic, sd, tie_rate, variance_under, alternative
+            )
+        else:
+            assert effect is not None  # guaranteed by the slot check
+            effect_arr = ones * float(effect)
+            n_eff_req = _required_n_eff(
+                lam_req, effect, statistic, sd, tie_rate, variance_under
+            )
+            if solved_for == "n_clusters":
+                assert items_per_cluster is not None
+                m_arr = ones * float(items_per_cluster)
+                de = 1.0 + (m_arr - 1.0) * rho_arr
+                # k enters n_eff linearly at fixed m_bar, so no search is
+                # needed once the required effective sample is known.
+                k_arr = n_eff_req * de / m_arr
+            else:
+                assert n_clusters is not None
+                k_arr = ones * float(n_clusters)
+                with np.errstate(divide="ignore"):
+                    reachable = np.where(rho_arr > 0.0, k_arr / rho_arr, np.inf)
+                blocked = n_eff_req >= reachable
+                if np.any(blocked):
+                    i = int(np.argmax(blocked))
+                    raise ValueError(
+                        f"no items_per_cluster reaches power {power} at "
+                        f"n_clusters={n_clusters}: with rho = {rho_arr[i]:g} "
+                        f"the effective sample is bounded above by "
+                        f"n_clusters / rho = {reachable[i]:g}, and this target "
+                        f"needs {n_eff_req:g}. Effective sample size is bought "
+                        "with clusters; items past the first few in a cluster "
+                        "buy rating work"
+                    )
+                # Inverting n_eff = k * m / (1 + (m - 1) * rho) for m. The
+                # ceiling above is this denominator reaching zero. Clamped at
+                # one item per cluster: where the design already reaches the
+                # target with a single item, one is the answer, and a fractional
+                # item count would be arithmetic rather than a design.
+                unclamped = n_eff_req * (1.0 - rho_arr) / (k_arr - n_eff_req * rho_arr)
+                clamped = unclamped < 1.0
+                m_arr = np.maximum(unclamped, 1.0)
+                de = 1.0 + (m_arr - 1.0) * rho_arr
+            n_eff = k_arr * m_arr / de
+            if solved_for == "items_per_cluster" and np.any(clamped):
+                # The clamp raises the design above the power that was asked
+                # for, so the requested figure is no longer this design's. The
+                # four quantities have to describe one design between them, not
+                # three of it and the target of the fourth.
+                achieved = _power_from_lambda(
+                    _lambda_of(effect, n_eff, statistic, sd, tie_rate, variance_under),
+                    z_crit,
+                    alternative,
+                )
+                power_arr = np.where(clamped, achieved, power_arr)
+
+    fewest = float(np.min(k_arr))
+    if fewest < MIN_CLUSTERS:
+        warnings.warn(
+            f"{fewest:g} clusters is below {MIN_CLUSTERS}; the cluster "
+            "bootstrap this power figure describes under-covers at that count, "
+            "so it rejects more often than alpha — the power quoted here "
+            "belongs to a test running at an error rate above the one stated",
+            FewClustersWarning,
+            stacklevel=2,
+        )
+
+    with np.errstate(divide="ignore"):
+        ceiling = np.where(rho_arr > 0.0, k_arr / rho_arr, np.inf)
+
+    return PowerAnalysisResult(
+        solved_for=solved_for,
+        statistic=statistic,
+        effect=effect_arr,
+        power=power_arr,
+        n_clusters=k_arr,
+        items_per_cluster=m_arr,
+        n_items=k_arr * m_arr,
+        n_eff=n_eff,
+        design_effect=de,
+        n_eff_ceiling=ceiling,
+        rho=rho_arr,
+        sd=sd,
+        tie_rate=tie_rate,
+        alpha=alpha,
+        alternative=alternative,
+        variance_under=variance_under,
+        coverage=coverage,
+        coverage_measured=None,
+        coverage_source=coverage_source,
+        method=method,
+        n_sim=None,
+        n_resamples=None,
+        mc_se=None,
+        seed=None,
+        curve=None,
+    )
