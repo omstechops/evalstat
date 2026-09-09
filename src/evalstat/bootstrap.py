@@ -10,6 +10,12 @@ given ``cluster=``.
 ``scipy.stats.bootstrap`` already handles the paired case; it has no notion of a
 cluster. That gap is the reason this module exists.
 
+The drawing itself is not here. It lives in :mod:`evalstat._resample`, keyed on
+indices, because the same cluster resampling carries every interval this package
+reports and only the statistic's argument contract differs between them. This
+module owns that contract for the paired case -- one vector of differences --
+and nothing else about the resampling.
+
 Documented coverage finding
 ---------------------------
 Empirical coverage of nominal 95% intervals, measured by the simulation in
@@ -48,15 +54,24 @@ and the default is open to revision if the measurement changes.
 
 from __future__ import annotations
 
-import secrets
-import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-from scipy.stats import norm
+
+from evalstat._resample import (
+    MIN_CLUSTERS,
+    MIN_VALID_FRACTION,
+    DegenerateResampleWarning,
+    FewClustersWarning,
+    check_resampling_arguments,
+    cluster_bootstrap,
+)
+
+# Re-exported in the alias form because it is not in __all__, and __all__ is
+# the curated public list rather than a record of what happens to be importable.
+from evalstat._resample import Method as Method
 
 __all__ = [
     "MIN_CLUSTERS",
@@ -66,31 +81,6 @@ __all__ = [
     "PairedBootstrapResult",
     "paired_bootstrap",
 ]
-
-MIN_CLUSTERS = 25
-"""Below this many clusters, :func:`paired_bootstrap` warns rather than fails."""
-
-MIN_VALID_FRACTION = 0.95
-"""Below this share of usable resamples, :func:`paired_bootstrap` raises."""
-
-Method = Literal["percentile", "basic", "bca"]
-
-
-class FewClustersWarning(UserWarning):
-    """Too few clusters for the resampling to be trusted at face value.
-
-    The cluster bootstrap is consistent in the number of *clusters*, not in the
-    number of items, so adding items to existing clusters does not silence this.
-    """
-
-
-class DegenerateResampleWarning(UserWarning):
-    """Some resamples produced no finite value and were discarded.
-
-    Raised as a warning while the discarded share stays small; past
-    :data:`MIN_VALID_FRACTION` it becomes an error, because the quantity being
-    reported has by then quietly become a conditional one.
-    """
 
 
 @dataclass(frozen=True)
@@ -165,128 +155,6 @@ def _as_differences(x: ArrayLike, y: ArrayLike | None) -> NDArray[np.float64]:
             "resolved before resampling, not dropped inside it"
         )
     return diff
-
-
-def _cluster_layout(
-    cluster: ArrayLike | None, n_pairs: int
-) -> tuple[NDArray[np.intp], NDArray[np.intp], NDArray[np.intp]]:
-    """Lay clusters out contiguously for indexing.
-
-    Returns ``(members, starts, sizes)`` where ``members`` holds every item index
-    grouped by cluster, and cluster ``c`` occupies
-    ``members[starts[c] : starts[c] + sizes[c]]``.
-
-    ``cluster=None`` is not a separate code path: it is expressed as one cluster
-    per item, so the independent case is standard bootstrap by construction
-    rather than by a second implementation that has to be kept in step.
-    """
-    if cluster is None:
-        labels = np.arange(n_pairs)
-    else:
-        labels = np.asarray(cluster)
-        if labels.shape != (n_pairs,):
-            raise ValueError(
-                f"cluster must have one label per pair; expected shape "
-                f"({n_pairs},), got {labels.shape}"
-            )
-    _, codes = np.unique(labels, return_inverse=True)
-    codes = codes.ravel()
-    members = np.argsort(codes, kind="stable").astype(np.intp)
-    sizes = np.bincount(codes).astype(np.intp)
-    starts = np.concatenate(([0], np.cumsum(sizes)[:-1])).astype(np.intp)
-    return members, starts, sizes
-
-
-def _draw_indices(
-    rng: np.random.Generator,
-    members: NDArray[np.intp],
-    starts: NDArray[np.intp],
-    sizes: NDArray[np.intp],
-) -> NDArray[np.intp]:
-    """Return the item indices of one with-replacement draw of whole clusters.
-
-    Clusters are drawn to the observed count, and every item of a drawn cluster
-    comes with it, so the resample size varies when clusters differ in size.
-
-    The index arithmetic replaces a per-cluster Python loop. ``ramp`` is the
-    position of each output slot *within* its own cluster: subtracting the
-    repeated output offsets from a plain arange restarts the count at every
-    cluster boundary, and adding the repeated source offsets then points each
-    slot at the right member.
-    """
-    drawn = rng.integers(0, sizes.size, size=sizes.size)
-    drawn_sizes = sizes[drawn]
-    total = int(drawn_sizes.sum())
-    out_starts = np.concatenate(([0], np.cumsum(drawn_sizes)[:-1]))
-    ramp = np.arange(total) - np.repeat(out_starts, drawn_sizes)
-    picked: NDArray[np.intp] = members[np.repeat(starts[drawn], drawn_sizes) + ramp]
-    return picked
-
-
-def _percentile_interval(
-    distribution: NDArray[np.float64], alpha: float
-) -> tuple[float, float]:
-    """Interval from the bootstrap quantiles themselves."""
-    low, high = np.quantile(distribution, [alpha / 2, 1 - alpha / 2])
-    return float(low), float(high)
-
-
-def _basic_interval(
-    distribution: NDArray[np.float64], estimate: float, alpha: float
-) -> tuple[float, float]:
-    """Interval reflected through the observed estimate."""
-    low, high = np.quantile(distribution, [alpha / 2, 1 - alpha / 2])
-    return float(2 * estimate - high), float(2 * estimate - low)
-
-
-def _bca_interval(
-    distribution: NDArray[np.float64],
-    estimate: float,
-    alpha: float,
-    statistic: Callable[[NDArray[np.float64]], float],
-    diff: NDArray[np.float64],
-    members: NDArray[np.intp],
-    starts: NDArray[np.intp],
-    sizes: NDArray[np.intp],
-) -> tuple[float, float]:
-    """Bias-corrected and accelerated interval, jackknifed over clusters.
-
-    The jackknife leaves out a whole cluster at a time, matching the unit the
-    bootstrap resamples. Leaving out an item instead would estimate the
-    acceleration from a dependence structure the interval does not use.
-    """
-    n_valid = distribution.size
-    below = float(np.count_nonzero(distribution < estimate))
-    # Keep the proportion off 0 and 1 so the normal quantile stays finite when
-    # the bootstrap distribution sits entirely to one side of the estimate.
-    guard = 1.0 / (2.0 * n_valid)
-    prop = min(max(below / n_valid, guard), 1.0 - guard)
-    z0 = float(norm.ppf(prop))
-
-    n_clusters = sizes.size
-    jack = np.empty(n_clusters, dtype=np.float64)
-    keep = np.ones(diff.size, dtype=bool)
-    for c in range(n_clusters):
-        block = members[starts[c] : starts[c] + sizes[c]]
-        keep[block] = False
-        jack[c] = statistic(diff[keep])
-        keep[block] = True
-    if not np.all(np.isfinite(jack)):
-        raise ValueError(
-            "leaving out a cluster made the statistic undefined, so the BCa "
-            "acceleration cannot be estimated; use method='percentile'"
-        )
-    centred = jack.mean() - jack
-    denominator = 6.0 * float(np.sum(centred**2)) ** 1.5
-    accel = 0.0 if denominator == 0 else float(np.sum(centred**3)) / denominator
-
-    z_low, z_high = norm.ppf([alpha / 2, 1 - alpha / 2])
-    adjusted = []
-    for z in (z_low, z_high):
-        shifted = z0 + z
-        adjusted.append(float(norm.cdf(z0 + shifted / (1 - accel * shifted))))
-    low, high = np.quantile(distribution, adjusted)
-    return float(low), float(high)
 
 
 def paired_bootstrap(
@@ -392,91 +260,33 @@ def paired_bootstrap(
        cannot be detected from the inside; item-level labels silently return the
        naive interval.
     """
-    if method not in ("percentile", "basic", "bca"):
-        raise ValueError(f"unknown method {method!r}")
-    if n_resamples < 1:
-        raise ValueError(f"n_resamples must be positive, got {n_resamples}")
-    if not 0.0 < confidence_level < 1.0:
-        raise ValueError(f"confidence_level must lie in (0, 1), got {confidence_level}")
-
+    # Ahead of _as_differences so that a malformed n_resamples is reported as
+    # such whether or not the data is also malformed; cluster_bootstrap checks
+    # the same three again, from the same definition.
+    check_resampling_arguments(n_resamples, confidence_level, method)
     diff = _as_differences(x, y)
-    members, starts, sizes = _cluster_layout(cluster, diff.size)
-    n_clusters = int(sizes.size)
-    if n_clusters < 2:
-        raise ValueError(f"need at least 2 clusters to resample, got {n_clusters}")
-    if n_clusters < MIN_CLUSTERS:
-        warnings.warn(
-            f"{n_clusters} clusters is below {MIN_CLUSTERS}; the cluster "
-            "bootstrap is consistent in the number of clusters, and at this "
-            "count the percentile interval under-covers — the interval it "
-            "reports is narrower than the truth, not wider",
-            FewClustersWarning,
-            stacklevel=2,
-        )
 
-    if isinstance(rng, np.random.Generator):
-        generator, seed = rng, None
-    else:
-        seed = secrets.randbits(64) if rng is None else int(rng)
-        generator = np.random.default_rng(seed)
-
-    estimate = float(statistic(diff))
-    values = np.empty(n_resamples, dtype=np.float64)
-    for i in range(n_resamples):
-        idx = _draw_indices(generator, members, starts, sizes)
-        values[i] = statistic(diff[idx])
-
-    finite = np.isfinite(values)
-    distribution = values[finite]
-    n_valid = int(distribution.size)
-    if n_valid < MIN_VALID_FRACTION * n_resamples:
-        raise ValueError(
-            f"only {n_valid} of {n_resamples} resamples produced a finite "
-            f"statistic, below the {MIN_VALID_FRACTION:.0%} floor. What is "
-            "left is a conditional quantity — the statistic among resamples "
-            "where it happened to be defined — and returning it as though it "
-            "were the requested one would be wrong"
-        )
-    if n_valid < n_resamples:
-        warnings.warn(
-            f"{n_resamples - n_valid} of {n_resamples} resamples produced no "
-            "finite statistic and were discarded",
-            DegenerateResampleWarning,
-            stacklevel=2,
-        )
-
-    alpha = 1.0 - confidence_level
-    if method == "percentile":
-        ci_low, ci_high = _percentile_interval(distribution, alpha)
-    elif method == "basic":
-        ci_low, ci_high = _basic_interval(distribution, estimate, alpha)
-    else:
-        ci_low, ci_high = _bca_interval(
-            distribution,
-            estimate,
-            alpha,
-            statistic,
-            diff,
-            members,
-            starts,
-            sizes,
-        )
-
+    drawn = cluster_bootstrap(
+        lambda idx: float(statistic(diff[idx])),
+        int(diff.size),
+        cluster=cluster,
+        unit="pair",
+        n_resamples=n_resamples,
+        confidence_level=confidence_level,
+        method=method,
+        rng=rng,
+    )
     return PairedBootstrapResult(
-        estimate=estimate,
-        ci_low=ci_low,
-        ci_high=ci_high,
+        estimate=drawn.estimate,
+        ci_low=drawn.ci_low,
+        ci_high=drawn.ci_high,
         confidence_level=confidence_level,
         method=method,
         n_pairs=int(diff.size),
-        n_clusters=n_clusters,
-        cluster_sizes=(
-            int(sizes.min()),
-            int(np.median(sizes)),
-            int(sizes.max()),
-        ),
+        n_clusters=drawn.n_clusters,
+        cluster_sizes=drawn.cluster_sizes,
         n_resamples=n_resamples,
-        n_valid=n_valid,
-        seed=seed,
-        distribution=distribution,
+        n_valid=drawn.n_valid,
+        seed=drawn.seed,
+        distribution=drawn.distribution,
     )
