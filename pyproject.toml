@@ -35,6 +35,9 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "mypy>=1.11",
+    # Test oracle only, never imported under src/: a reference value must not
+    # come from the same code as the answer. See docs/design/judge_agreement.md.
+    "scikit-learn>=1.5",
 ]
 
 [project.urls]
@@ -104,4 +107,10 @@ strict = true
 [[tool.mypy.overrides]]
 # scipy publishes no stubs of its own; only norm.ppf/norm.cdf are used here.
 module = "scipy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# scikit-learn ships no py.typed marker. It appears in tests only, as the second
+# witness for a reference value; only cohen_kappa_score is called.
+module = "sklearn.*"
 ignore_missing_imports = true
