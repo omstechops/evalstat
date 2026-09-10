@@ -558,37 +558,76 @@ def test_j8_weight_schemes_are_not_comparable() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_j9_constant_judge_raises_naming_the_rater_and_category() -> None:
-    """A judge that answered "equal" every time has no coefficient at all.
+def test_j9_one_constant_rater_is_exactly_zero_and_not_an_error() -> None:
+    """A judge that answered "equal" every time scores exactly 0, not an error.
 
-    The chance model then expects perfect agreement, kappa's denominator is
-    zero, and the quotient is undefined. That is a rubric dimension the judge
-    did not discriminate on, not a numerical accident, so it is an error rather
-    than a NaN -- and the message names the rater and the category, because
-    "denominator is zero" does not tell anyone what to go and look at.
+    This is the half of the degenerate case that is easy to get wrong, so it is
+    pinned first. With the judge constant at one category the observed
+    disagreement and the expected disagreement are the same sum term by term --
+    the joint distribution *is* the product of the marginals, because a point
+    mass is independent of everything -- so the ratio is one and kappa is
+    exactly zero.
+
+    Zero is the right answer and a meaningful one: a rater who always says the
+    same thing agrees exactly as often as chance predicts, which is what the
+    coefficient is built to report. Raising here would throw away a correct
+    measurement, and the diagnostics say what happened -- the table has one
+    non-empty row.
     """
     categories = ("A", "equal", "B")
     judge = np.array(["equal"] * 30)
     human = np.array(["A", "equal", "B"] * 10)
 
-    with pytest.raises(ValueError, match="judge"):
-        agree(judge, human, categories, "linear")
-    with pytest.raises(ValueError, match="equal"):
-        agree(judge, human, categories, "linear")
+    result = agree(judge, human, categories, "linear")
+
+    assert result.kappa == 0.0
+    assert result.kappa == pytest.approx(
+        sklearn_kappa(judge, human, categories, "linear")
+    )
+    assert np.count_nonzero(result.table.sum(axis=1)) == 1
 
 
-def test_j9_both_raters_constant_raises() -> None:
-    """Perfect agreement on one category is the same degenerate case.
+def test_j9_two_constant_raters_on_different_categories_is_also_zero() -> None:
+    """Still not degenerate: two point masses, one apart, still give exactly 0.
 
-    It is worth its own test because it is the one place where a caller might
-    expect 1.0: the raters did agree on every item. They agree on every item
-    the chance model also expects them to agree on, so there is nothing left
-    for the coefficient to measure.
+    The boundary matters because it says what the degenerate case actually is.
+    Both raters constant is not enough; a table with its whole mass in one
+    off-diagonal cell has a non-zero expected disagreement equal to its observed
+    one, so the coefficient is defined and zero.
+    """
+    categories = ("A", "equal", "B")
+    judge = np.array(["A"] * 30)
+    human = np.array(["B"] * 30)
+
+    result = agree(judge, human, categories, "linear")
+
+    assert result.kappa == 0.0
+    assert result.p_observed == 0.0
+
+
+def test_j9_both_raters_on_one_category_raises_naming_the_state() -> None:
+    """The one degenerate table there is, and the message has to say which.
+
+    ``sum(w * outer(r, c))`` is zero only where the weight is zero wherever the
+    two marginals have mass together, and the weight is zero only on the
+    diagonal, so the denominator vanishes exactly when both raters used one and
+    the same category throughout. Then the chance model already expects perfect
+    agreement, the raters deliver it, and there is nothing left for the
+    coefficient to measure: 0/0.
+
+    It is an error rather than a NaN because it is a fact about the data -- a
+    rubric dimension nobody discriminated on -- and a NaN invites being read as
+    a number. The message names the state in those words: both raters, that
+    category, expected agreement 1, kappa undefined.
     """
     categories = ("A", "equal", "B")
     labels = np.array(["equal"] * 30)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="both raters"):
+        agree(labels, labels.copy(), categories, "linear")
+    with pytest.raises(ValueError, match="equal"):
+        agree(labels, labels.copy(), categories, "linear")
+    with pytest.raises(ValueError, match="undefined"):
         agree(labels, labels.copy(), categories, "linear")
 
 

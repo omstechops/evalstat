@@ -235,18 +235,32 @@ pre-empting the rule.
 
 ## 7. Degenerate tables (D8)
 
-Kappa's denominator `1 - p_e` vanishes when a rater is constant: the chance model
-then expects perfect agreement, and the coefficient is 0/0.
+**Corrected when the body was written.** This section first said the denominator
+vanishes "when a rater is constant". It does not. With one rater constant the
+joint distribution *is* the product of the marginals — a point mass is
+independent of everything — so observed and expected disagreement are equal term
+by term and kappa is exactly **0**, which is both defined and the right answer: a
+rater who always says the same thing agrees exactly as often as chance predicts.
+Two constant raters on *different* categories also give exactly 0.
+
+The denominator vanishes in one situation only. `sum(w * outer(r, c)) = 0`
+requires the weight to be zero wherever the two marginals have mass together,
+and the weight is zero only on the diagonal, so both marginals must be the same
+single point: **both raters used one and the same category throughout.** Then the
+chance model already expects perfect agreement, the raters deliver it, and the
+coefficient is 0/0.
 
 Two cases, deliberately handled differently:
 
 | | Case | Behaviour | Why |
 |---|---|---|---|
-| Observed table | a rater used one category for every item | `ValueError`, naming the state | This is a fact about the data — a rubric dimension nobody discriminated on, or a judge that answered the same thing every time. It is not a numerical accident, and returning `nan` invites being read and reported as a number. |
-| A resample | the draw left a rater constant | `nan`, discarded by the shared machinery | Expected at small cluster counts, counted in `n_valid`, surfaced as `DegenerateResampleWarning`, and an error past `MIN_VALID_FRACTION`. That policy already exists and is not duplicated here. |
+| Observed table | both raters used one and the same category for every item | `ValueError`, naming the state | A fact about the data — a rubric dimension nobody discriminated on. Not a numerical accident, and returning `nan` invites being read and reported as a number. |
+| A resample | the draw left both raters on one category | `nan`, discarded by the shared machinery | Expected at small cluster counts, counted in `n_valid`, surfaced as `DegenerateResampleWarning`, and an error past `MIN_VALID_FRACTION`. That policy already exists and is not duplicated here. |
 
-The error message names the state rather than the arithmetic: which rater was
-constant and which category they used, not "denominator is zero".
+The error message names the state rather than the arithmetic: both raters, that
+category, expected agreement 1, kappa undefined — not "denominator is zero". It
+also says what the case is *not*, because one constant rater is the reading a
+caller is likely to arrive with.
 
 ## 8. Decisions taken
 
@@ -353,7 +367,7 @@ measurement rather than from this paragraph.
 | J6 | Bias: a harsher judge | Hand-worked: `p_o = 0.65` with `kappa = 0.18 / 0.53`, prevalence index 0.05, bias index 0.25. The mirror image of J5, so that the two indices are shown to separate the two failures rather than both tracking kappa. | fast |
 | J7 | Categories are not inferred | One five-point dataset used only at 1, 2 and 5. Dropping the unused labels changes the coefficient; dropping a label from the end of a dataset used at 1–4 does not, and the table and prevalence index change in both cases. Pins §3's *intermittent* failure in both of its states. Reordering the labels changes the coefficient too. | fast |
 | J8 | The schemes are not comparable | A table whose disagreements are all adjacent: hand-worked `kappa` of `0.4140625 / 0.6640625` unweighted against `0.3046875 / 0.4296875` linear, so linear is the higher of the two, and neither number means anything without its scheme. | fast |
-| J9 | Degenerate observed table | A rater who used one category throughout: `ValueError`, and the message names that rater and that category rather than the arithmetic. Both-constant is the same case. | fast |
+| J9 | Degeneracy, and its boundary | Three cases, because the boundary is where the arithmetic was first got wrong. One constant rater: exactly 0, defined, with `sklearn` agreeing. Two constant raters on different categories: exactly 0. Both on the same category: `ValueError` whose message names both raters, the category, and the word undefined. | fast |
 | J10 | Input rejection | Mismatched lengths across `judge`, `human`, `ceiling` and `cluster`; a label absent from `categories`; `categories` repeating a label or holding one; a missing or unknown `weights`, `"quadratic"` included; the resampling arguments; fewer than two clusters. | fast |
 
 ### Stage two — the clustered interval (J11–J12)

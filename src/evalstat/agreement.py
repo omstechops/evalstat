@@ -81,7 +81,11 @@ from typing import Literal
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from evalstat._resample import Method
+from evalstat._resample import (
+    Method,
+    check_resampling_arguments,
+    cluster_bootstrap,
+)
 
 __all__ = [
     "HumanCeiling",
@@ -246,7 +250,52 @@ def _weight_matrix(n_categories: int, weights: Weights) -> NDArray[np.float64]:
     ``n_categories - 1`` only keeps the entries in ``[0, 1]`` where they are
     easier to read.
     """
-    raise NotImplementedError
+    position = np.arange(n_categories)
+    distance = np.abs(position[:, None] - position[None, :]).astype(np.float64)
+    if weights == "linear":
+        return distance / (n_categories - 1)
+    return (distance > 0.0).astype(np.float64)
+
+
+def _cross_table(
+    a: NDArray[np.intp], b: NDArray[np.intp], n_categories: int
+) -> NDArray[np.int64]:
+    """Count each ordered pair of codes, rows ``a`` and columns ``b``.
+
+    Every declared category keeps its row and column whether or not anyone used
+    it, which is what makes the weight matrix line up with the table: a category
+    dropped here would shift every position after it and quietly re-space the
+    scale. See assumption 2.
+    """
+    counts = np.bincount(a * n_categories + b, minlength=n_categories**2)
+    return counts.reshape(n_categories, n_categories).astype(np.int64)
+
+
+def _encode(
+    values: ArrayLike, lookup: dict[object, int], name: str
+) -> NDArray[np.intp]:
+    """Turn labels into positions in ``categories``.
+
+    Positions, not labels, are what the arithmetic uses, and resolving them once
+    outside the resampling loop is what stops the scale moving between
+    resamples. A label the design did not declare is an error rather than a new
+    category: inventing one here would silently widen the scale.
+    """
+    array = np.asarray(values)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional, got shape {array.shape}")
+    codes = np.empty(array.size, dtype=np.intp)
+    for i, label in enumerate(array.tolist()):
+        try:
+            codes[i] = lookup[label]
+        except KeyError:
+            raise ValueError(
+                f"{name} contains {label!r}, which is not in categories "
+                f"{list(lookup)!r}. The category set comes from the rating "
+                "design, so a label outside it is a data error, not a category "
+                "this function may add"
+            ) from None
+    return codes
 
 
 def _kappa(
@@ -262,13 +311,22 @@ def _kappa(
     loop, and cannot shift between resamples.
 
     Returns ``nan`` when the expected disagreement is zero, which happens when a
-    resample leaves one rater constant. That is the shared machinery's contract
-    for an undefined resample: it is discarded, counted, and turns into a
-    warning or -- past :data:`evalstat.MIN_VALID_FRACTION` -- an error. The
-    *observed* table is a different case and is checked before any resampling
-    begins; see :func:`judge_agreement`.
+    resample leaves both raters on one and the same category. That is the only
+    way the denominator vanishes: ``sum(w * outer(r, c))`` is zero only if the
+    weight is zero wherever the two marginals have mass together, and the weight
+    is zero only on the diagonal. It is the shared machinery's contract for an
+    undefined resample: discarded, counted, and turned into a warning or --
+    past :data:`evalstat.MIN_VALID_FRACTION` -- an error. The *observed* table
+    is the same arithmetic and a different decision, checked before any
+    resampling begins; see :func:`judge_agreement`.
     """
-    raise NotImplementedError
+    n_categories = int(weight.shape[0])
+    observed = _cross_table(a, b, n_categories) / a.size
+    expected = np.outer(observed.sum(axis=1), observed.sum(axis=0))
+    disagreement_expected = float((weight * expected).sum())
+    if disagreement_expected == 0.0:
+        return float("nan")
+    return 1.0 - float((weight * observed).sum()) / disagreement_expected
 
 
 def judge_agreement(
@@ -425,8 +483,12 @@ def judge_agreement(
     8. **Consistency is in the number of clusters, not the number of items.**
        Rating more items inside the same clusters buys precision the interval is
        not entitled to. See :data:`evalstat.MIN_CLUSTERS`.
-    9. **Kappa is a ratio and can be undefined.** When a rater is constant, the
-       chance model expects perfect agreement and the denominator vanishes.
+    9. **Kappa is a ratio and can be undefined, in exactly one situation.** The
+       denominator ``1 - p_expected`` vanishes only when *both* raters used one
+       and the same category throughout: the chance model then expects perfect
+       agreement, and the coefficient is 0/0. One constant rater is not that
+       case -- it gives exactly 0, which is the right answer, since a rater who
+       always says the same thing agrees exactly as often as chance predicts.
        Observed: an error naming the state. Resampled: discarded, counted, and
        an error if too many.
     10. **This returns an interval, not a test.** It carries no null hypothesis,
@@ -447,4 +509,128 @@ def judge_agreement(
     The decisions behind this interface, the alternatives rejected and the
     questions still open are in ``docs/design/judge_agreement.md``.
     """
-    raise NotImplementedError
+    # Ahead of the data, so that a malformed n_resamples is reported as such
+    # whether or not the data is also malformed; cluster_bootstrap checks the
+    # same three again, from the same definition.
+    check_resampling_arguments(n_resamples, confidence_level, method)
+
+    if weights not in ("linear", "unweighted"):
+        # Widened deliberately: the annotation says this cannot happen and the
+        # runtime is where it does, so the comparison below has to survive the
+        # type checker narrowing `weights` to nothing.
+        supplied: object = weights
+        offered = "'linear' or 'unweighted'"
+        if supplied == "quadratic":
+            raise ValueError(
+                f"weights must be {offered}; quadratic weighting is not offered "
+                "at all. It charges a neighbouring disagreement a quarter of "
+                "what it charges a two-step one, and on a preference scale the "
+                "confusion between adjacent categories is the thing being "
+                "measured. See docs/design/judge_agreement.md"
+            )
+        raise ValueError(f"weights must be {offered}, got {supplied!r}")
+
+    declared = list(categories)
+    if len(declared) < 2:
+        raise ValueError(
+            f"categories needs at least two labels, got {len(declared)}. A "
+            "scale with one category records no distinction, so there is no "
+            "agreement to measure"
+        )
+    lookup: dict[object, int] = {}
+    for position, label in enumerate(declared):
+        if label in lookup:
+            raise ValueError(
+                f"categories repeats {label!r}. Distances are counted in "
+                "positions on the scale, so a repeated label would occupy two "
+                "positions and sit at a distance from itself"
+            )
+        lookup[label] = position
+
+    judge_codes = _encode(judge, lookup, "judge")
+    human_codes = _encode(human, lookup, "human")
+    if human_codes.shape != judge_codes.shape:
+        raise ValueError(
+            f"judge and human must rate the same items; got "
+            f"{judge_codes.shape} and {human_codes.shape}. Rating must be "
+            "complete: an item one rater skipped breaks the design, it does "
+            "not shorten it"
+        )
+    n_items = int(judge_codes.size)
+    if n_items == 0:
+        raise ValueError("need at least one rated item")
+
+    if ceiling is not None:
+        ceiling_codes = _encode(ceiling, lookup, "ceiling")
+        if ceiling_codes.shape != judge_codes.shape:
+            raise ValueError(
+                f"ceiling must rate the same items as judge and human; got "
+                f"{ceiling_codes.shape} and {judge_codes.shape}. The ceiling is "
+                "measured on the items the judge was measured on, or it is not "
+                "the ceiling of this measurement"
+            )
+
+    n_categories = len(declared)
+    weight = _weight_matrix(n_categories, weights)
+    table = _cross_table(judge_codes, human_codes, n_categories)
+    observed = table / n_items
+    expected = np.outer(observed.sum(axis=1), observed.sum(axis=0))
+    disagreement_observed = float((weight * observed).sum())
+    disagreement_expected = float((weight * expected).sum())
+
+    if disagreement_expected == 0.0:
+        # The only way the denominator vanishes: see _kappa. Naming the state is
+        # the whole point of raising here rather than returning nan -- the
+        # caller has a rubric dimension nobody discriminated on, and needs to be
+        # told that rather than handed a number-shaped absence.
+        used = declared[int(np.argmax(np.diag(table)))]
+        raise ValueError(
+            f"both raters used the category {used!r} for all {n_items} rated "
+            "items, so the chance model expects perfect agreement "
+            "(p_expected = 1) and kappa is undefined: its denominator is zero. "
+            "This is a fact about the data, not a numerical accident, so it is "
+            "an error and not a NaN. One constant rater is a different case and "
+            "is not an error: it gives exactly 0"
+        )
+
+    if ceiling is not None:
+        raise NotImplementedError(
+            "the human ceiling comparison is not implemented yet; the "
+            "coefficient and its diagnostics are. See section 6 of "
+            "docs/design/judge_agreement.md"
+        )
+
+    drawn = cluster_bootstrap(
+        lambda idx: _kappa(judge_codes[idx], human_codes[idx], weight),
+        n_items,
+        cluster=cluster,
+        unit="rated item",
+        n_resamples=n_resamples,
+        confidence_level=confidence_level,
+        method=method,
+        rng=rng,
+    )
+    return JudgeAgreementResult(
+        kappa=drawn.estimate,
+        ci_low=drawn.ci_low,
+        ci_high=drawn.ci_high,
+        confidence_level=confidence_level,
+        method=method,
+        weights=weights,
+        categories=tuple(declared),
+        p_observed=1.0 - disagreement_observed,
+        p_expected=1.0 - disagreement_expected,
+        prevalence_index=float(np.diag(observed).max() - np.diag(observed).min()),
+        bias_index=float(
+            np.abs(observed.sum(axis=1) - observed.sum(axis=0)).sum() / 2.0
+        ),
+        table=table,
+        n_items=n_items,
+        n_clusters=drawn.n_clusters,
+        cluster_sizes=drawn.cluster_sizes,
+        n_resamples=n_resamples,
+        n_valid=drawn.n_valid,
+        seed=drawn.seed,
+        distribution=drawn.distribution,
+        ceiling=None,
+    )
