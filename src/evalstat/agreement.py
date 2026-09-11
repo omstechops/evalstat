@@ -11,9 +11,61 @@ the failure modes this module reports beside it rather than behind it.
 Clustering is the reason it is written here rather than called from elsewhere.
 ``sklearn.metrics.cohen_kappa_score`` computes the coefficient and stops; there
 is no interval, and no notion that three items cut from one recording carry a
-shared component. An interval that resamples items would be too narrow for the
-same reason it is too narrow in :mod:`evalstat.bootstrap`, and the whole point
-of quoting an agreement figure is to say how far it could be from the truth.
+shared component. An interval that resamples items is too narrow when that
+shared component reaches the *agreement* -- when some recordings are hard for
+both raters at once -- and the whole point of quoting an agreement figure is to
+say how far it could be from the truth. When only the labels share a component
+and the disagreement does not, the naive interval turns out to be nearly right;
+the table below is the measurement of both cases, and it is not the same
+picture :mod:`evalstat.bootstrap` paints for the mean.
+
+Documented coverage finding
+---------------------------
+Empirical coverage of nominal 95% percentile intervals, measured by the
+simulation in
+``tests/test_agreement_interval.py::test_j11_coverage_depends_on_what_is_clustered``:
+300 datasets at k = 40 clusters, m = 3 items each, linear-weighted kappa on
+three categories, 499 resamples per interval. The latent quality behind the
+ratings has intra-cluster correlation 0.5 at every row; what varies down the
+table is ``difficulty_sd``, the spread of a cluster-level factor on both raters'
+noise, reported beside the ICC it produces in the per-item disagreement
+indicator. The population kappa of each row is ``sklearn``'s figure on 150,000
+items from the same generator.
+
+=============  =====  =====  ==================  =============  ===========
+difficulty_sd  ICC    kappa  Item-level (naive)  Cluster-level  Width ratio
+=============  =====  =====  ==================  =============  ===========
+0.0            0.013  0.506  0.920               0.927          1.04
+0.7            0.135  0.483  0.940               0.943          1.10
+2.0            0.262  0.460  0.920               0.950          1.18
+=============  =====  =====  ==================  =============  ===========
+
+Monte Carlo standard error on each coverage figure is about 0.013; the width
+ratio (mean clustered width over mean naive width) is known far more precisely,
+since width is deterministic per dataset. Three things follow.
+
+**Whether clustering matters to kappa depends on what is clustered.** The
+first row has the labels clustered as strongly as the others -- a latent ICC of
+0.5 -- and the two intervals are the same to within noise, 4% apart in width.
+Kappa is a ratio of an observed to an expected disagreement, and a component
+shared by every item of a cluster moves both and largely cancels. What the
+correction needs is a between-cluster component in the *disagreement itself*:
+at a disagreement ICC of 0.26 the clustered interval is 18% wider, the naive
+one covers 0.92 and the clustered one 0.95. So ``cluster=`` is not a formality
+here the way it is for a mean, and neither is it harmless to omit: the study's
+recordings will differ in how contestable they are, and that is exactly the
+component the first row lacks.
+
+**Neither interval reaches nominal in the first row.** At 120 items and forty
+clusters the percentile interval of a kappa covers about 0.92-0.93 with no
+clustering to blame, which is the small-sample behaviour of a bootstrapped
+ratio rather than anything about clusters. A study reporting a 95% interval
+from this function at this size should say so.
+
+**Only the percentile method is measured.** The paired bootstrap's table found
+the three methods indistinguishable at forty clusters and chose the one with
+the fewest estimated quantities; this module inherits that default rather than
+re-measuring it, and the inheritance is open to revision if someone does.
 
 Why this is not a call into ``paired_bootstrap``
 ------------------------------------------------

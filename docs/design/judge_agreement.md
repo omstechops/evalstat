@@ -355,6 +355,20 @@ lands, the coverage figures go into the `evalstat.agreement` module docstring th
 way the paired bootstrap's table did, and J11's bounds are set from that
 measurement rather than from this paragraph.
 
+*Settled 11 September.* The first measurement, with the generator carried over
+from `test_bootstrap.py`, gave naive 0.955 and clustered 0.950 at 200 datasets:
+no under-coverage to correct, and a disagreement ICC of 0.01. The generator
+clustered the *labels* but not the *agreement* — each rater's noise was
+independent and unclustered, and the clustered part of the latent quality moves
+kappa's numerator and denominator together. The premise carried over from the
+paired bootstrap was untested for kappa, and it does not carry over unchanged.
+The generator now has a `difficulty_sd` knob (a cluster-level factor on both
+raters' noise, so that a hard recording is hard for everyone) and J11 measures
+three settings of it, with the disagreement ICC each produces. Both regimes are
+asserted: at zero the two intervals must agree, so that "no effect" is not later
+read as a broken resampler; at the top the naive interval must under-cover. The
+table is in the module docstring. The tolerances there are measured.
+
 ### Stage one — the coefficient (J1–J10)
 
 | # | Case | Where the known answer comes from | Speed |
@@ -374,7 +388,7 @@ measurement rather than from this paragraph.
 
 | # | Case | Where the known answer comes from | Speed |
 |---|---|---|---|
-| J11 | Clustering restores coverage | The measurement `paired_bootstrap` already carries, repeated for kappa. Ratings are generated with a cluster-level shared component; the population kappa of that generator is computed by `sklearn` on a very large draw from it, never by this code; coverage of nominal 95% intervals is counted with and without `cluster=`, with its Monte Carlo error. The same test carries provenance: the seed is recorded when none was passed, a rerun at that seed reproduces the interval, and the few-clusters warning fires where it should. | slow |
+| J11 | Coverage depends on what is clustered | The measurement `paired_bootstrap` already carries, repeated for kappa, at three settings of one generator: labels clustered but agreement not, and two strengths of cluster-level difficulty shared by both raters. The population kappa of each setting is computed by `sklearn` on a very large draw from it, never by this code; coverage of nominal 95% intervals is counted with and without `cluster=`, with its Monte Carlo error, and the two are asserted equal where agreement is not clustered and apart where it is. The same test carries provenance: the seed is recorded when none was passed, a rerun at that seed reproduces the interval, and the few-clusters warning fires where it should. | slow |
 | J12 | The ceiling comparison is paired | At a fixed seed, `difference` equals `kappa - ceiling.kappa` exactly, and its interval is **narrower** than one built from the two kappas' intervals as though they were independent. That inequality is D7's first reason and it is measurable. Passing `ceiling` also leaves the judge's own kappa and interval untouched at the same seed: the ceiling is an addition, not a modification. | fast |
 
 J7 and J12 are differential: they pin a stated behaviour against another run of
