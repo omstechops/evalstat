@@ -29,6 +29,7 @@ import pytest
 from numpy.typing import NDArray
 from sklearn.metrics import cohen_kappa_score
 
+from evalstat import FewClustersWarning
 from evalstat.agreement import JudgeAgreementResult, Weights, judge_agreement
 
 # These cases are about the point estimate, so the interval is bought at the
@@ -629,6 +630,101 @@ def test_j9_both_raters_on_one_category_raises_naming_the_state() -> None:
         agree(labels, labels.copy(), categories, "linear")
     with pytest.raises(ValueError, match="undefined"):
         agree(labels, labels.copy(), categories, "linear")
+
+
+# ---------------------------------------------------------------------------
+# J13  the disagreement ICC, against hand-computed references
+# ---------------------------------------------------------------------------
+
+
+def _icc_of(
+    judge: list[int], human: list[int], cluster: list[int] | None
+) -> tuple[float, tuple[int, int, int]]:
+    """Run at a cluster count that warns, and keep the warning out of the way.
+
+    Two-to-four clusters is far below the floor, and the floor is not what
+    these cases are about; they pin an arithmetic identity, not an interval.
+    The judge alternates 0 and 2 inside every cluster so that no resample can
+    leave both raters constant on one category, which keeps the degenerate
+    machinery out of the way as well.
+    """
+    with pytest.warns(FewClustersWarning):
+        result = judge_agreement(
+            judge,
+            human,
+            categories=(0, 1, 2),
+            weights="linear",
+            cluster=cluster,
+            n_resamples=50,
+            rng=0,
+        )
+    return result.disagreement_icc, result.cluster_sizes
+
+
+def test_j13_disagreement_entirely_between_clusters_is_one() -> None:
+    """Four clusters of two: two agree on every item, two disagree by two steps.
+
+    Linear weights on three categories charge a 0-vs-2 disagreement 1, so the
+    per-item disagreement is ``[0, 0, 0, 0, 1, 1, 1, 1]`` by cluster. Cluster
+    means 0, 0, 1, 1; grand mean 0.5; ``MS_between = 2 * 4 * 0.25 / 3 = 2/3``;
+    ``MS_within = 0``. ICC is ``(2/3 - 0) / (2/3 + 0) = 1``.
+    """
+    icc, sizes = _icc_of(
+        [0, 2, 0, 2, 0, 2, 0, 2],
+        [0, 2, 0, 2, 2, 0, 2, 0],
+        [0, 0, 1, 1, 2, 2, 3, 3],
+    )
+    assert icc == pytest.approx(1.0)
+    assert sizes == (2, 2, 2)
+
+
+def test_j13_disagreement_entirely_within_clusters_is_minus_one() -> None:
+    """Every cluster holds one agreement and one two-step disagreement.
+
+    Disagreement ``[0, 1]`` in each of four clusters: every cluster mean is
+    0.5, so ``MS_between = 0``; ``MS_within = 8 * 0.25 / (8 - 4) = 0.5``. ICC
+    is ``(0 - 0.5) / (0 + 0.5) = -1``: the estimator is not clipped, and a
+    negative value says the clusters are *more* alike than independence.
+    """
+    icc, _ = _icc_of(
+        [0, 2, 0, 2, 0, 2, 0, 2],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 1, 1, 2, 2, 3, 3],
+    )
+    assert icc == pytest.approx(-1.0)
+
+
+def test_j13_unequal_cluster_sizes_use_the_unbalanced_form() -> None:
+    """One cluster of one item and one of three, worked by hand.
+
+    Disagreement ``[0.5 | 1, 1, 0]``: a one-step disagreement alone, then two
+    two-step disagreements and an agreement. ``N = 4``, ``k = 2``; cluster
+    means 1/2 and 2/3, grand mean 5/8. ``MS_between = 1 * (1/8)**2 + 3 *
+    (1/24)**2 = 1/48``. ``MS_within = (1/9 + 1/9 + 4/9) / (4 - 2) = 1/3``.
+    ``m0 = (4 - (1 + 9) / 4) / 1 = 3/2``. ICC is ``(1/48 - 1/3) / (1/48 + 1/2
+    * 1/3) = (-15/48) / (9/48) = -5/3``. With the balanced formula and any
+    single ``m`` this number is not reproducible, which is what pins the form.
+    """
+    icc, sizes = _icc_of([0, 0, 2, 0], [1, 2, 0, 0], [0, 1, 1, 1])
+    assert icc == pytest.approx(-5.0 / 3.0)
+    assert sizes == (1, 2, 3)
+
+
+def test_j13_without_clusters_the_icc_is_nan() -> None:
+    """No clustering, nothing within clusters to compare: ``nan``, not 0.
+
+    Zero would claim a measurement -- "no clustering was found" -- when none
+    was possible; ``nan`` says the quantity is undefined here.
+    """
+    result = judge_agreement(
+        [0, 2] * 15,
+        [0, 0] * 15,
+        categories=(0, 1, 2),
+        weights="linear",
+        n_resamples=50,
+        rng=0,
+    )
+    assert np.isnan(result.disagreement_icc)
 
 
 # ---------------------------------------------------------------------------

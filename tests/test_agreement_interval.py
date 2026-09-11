@@ -265,6 +265,25 @@ def test_j11_clustered_interval_is_wider_than_the_naive_one() -> None:
     assert clustered.cluster_sizes == (3, 3, 3)
 
 
+def test_j11_the_result_carries_the_icc_the_table_is_indexed_by() -> None:
+    """``disagreement_icc`` on the result matches this file's own estimator.
+
+    The coverage table is indexed by the disagreement ICC, and the table is
+    useless to a reader who cannot compute the index for their own data. So
+    the result carries it. The estimator here is the balanced-form ICC(1)
+    this file used to describe the generator; on equal clusters the
+    unbalanced form the package uses reduces to it exactly.
+    """
+    (judge, human), cluster = clustered_ratings(
+        np.random.default_rng(17), 40, 3, difficulty_sd=DIFFICULTY_LEVELS[-1]
+    )
+    result = agree(judge, human, cluster=cluster, n_resamples=50, rng=18)
+    assert result.disagreement_icc == pytest.approx(
+        disagreement_icc(judge, human, 3), abs=1e-12
+    )
+    assert result.disagreement_icc > 0.1
+
+
 def test_j11_few_clusters_warns() -> None:
     """Ten clusters is below the floor, and the warning is not optional.
 

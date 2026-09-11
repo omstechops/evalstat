@@ -165,6 +165,20 @@ with the table is the index being a summary, not the table being wrong.
 coefficient answers the paradox by removing the chance correction. If the
 correction is wrong for this table, the table is what should be shown.
 
+**A fourth diagnostic, added 11 September: the disagreement ICC.** The coverage
+measurement (J11, §10) found that whether `cluster=` changes the interval
+depends on whether the *disagreement* is clustered, not whether the labels
+are, and the module docstring's table is indexed by the intra-cluster
+correlation of the per-item weighted disagreement. A reader placing their
+interval in that table needs that number for their own data, so the result
+carries it as `disagreement_icc`: one-way ANOVA ICC(1) in the unbalanced form,
+unclipped, `nan` without clusters. It is a field and not a function, on the
+owner's decision: the quantity is narrow — the ICC of one indicator under the
+weights in force — and the general intraclass correlation of a clustered
+continuous outcome is the different thing D3 defers. J13 pins it on hand-worked
+cases, including one with unequal cluster sizes that the balanced formula
+cannot reproduce.
+
 ## 6. The human ceiling (D7)
 
 ### The argument the interface is built on
@@ -413,6 +427,7 @@ table is in the module docstring. The tolerances there are measured.
 | # | Case | Where the known answer comes from | Speed |
 |---|---|---|---|
 | J11 | Coverage depends on what is clustered | The measurement `paired_bootstrap` already carries, repeated for kappa, at three settings of one generator: labels clustered but agreement not, and two strengths of cluster-level difficulty shared by both raters. The population kappa of each setting is computed by `sklearn` on a very large draw from it, never by this code; coverage of nominal 95% intervals is counted with and without `cluster=`, with its Monte Carlo error, and the two are asserted equal where agreement is not clustered and apart where it is. The same test carries provenance: the seed is recorded when none was passed, a rerun at that seed reproduces the interval, and the few-clusters warning fires where it should. | slow |
+| J13 | The disagreement ICC | Hand-worked references in `test_agreement.py`: disagreement entirely between clusters gives 1, entirely within gives -1, an unbalanced case (clusters of 1 and 3) gives -5/3 and pins the unbalanced form, no clustering gives `nan`. `test_agreement_interval.py` checks the field against that file's own balanced-form estimator on study-sized data. | fast |
 | J12 | The ceiling comparison is paired | At a fixed seed, `difference` equals `kappa - ceiling.kappa` exactly, and its interval is **narrower** than one built from the two kappas' intervals as though they were independent. That inequality is D7's first reason and it is measurable. Passing `ceiling` also leaves the judge's own kappa and interval untouched at the same seed: the ceiling is an addition, not a modification. | fast |
 
 J7 and J12 are differential: they pin a stated behaviour against another run of

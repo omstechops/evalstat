@@ -54,7 +54,9 @@ at a disagreement ICC of 0.26 the clustered interval is 18% wider, the naive
 one covers 0.92 and the clustered one 0.95. So ``cluster=`` is not a formality
 here the way it is for a mean, and neither is it harmless to omit: the study's
 recordings will differ in how contestable they are, and that is exactly the
-component the first row lacks.
+component the first row lacks. Which row a given dataset sits in is a fact
+about that dataset, and the result carries it as ``disagreement_icc`` so that
+an interval quoted from this function can be placed in this table.
 
 **Neither interval reaches nominal in the first row.** At 120 items and forty
 clusters the percentile interval of a kappa covers about 0.92-0.93 with no
@@ -261,6 +263,22 @@ class JudgeAgreementResult:
         How far the two raters' marginal distributions are from each other. A
         judge that is systematically harsher than the human scores a high bias
         index, and that is a different defect from disagreeing at random.
+    disagreement_icc
+        Intra-cluster correlation of the per-item weighted disagreement: how
+        much of the variance in "how far apart were the two raters on this
+        item" sits between clusters. One-way ANOVA ICC(1), on the unbalanced
+        form so that clusters of unequal size are handled; it can be negative,
+        and is reported as computed. ``nan`` when ``cluster`` is None -- there
+        is no within-cluster variance to compare against -- and when the
+        disagreement is constant across every item.
+
+        This is the fourth diagnostic, not a general-purpose ICC: it is defined
+        on the disagreement indicator under the ``weights`` in force and on
+        nothing else, and it exists because the coverage table in the module
+        docstring turns on it. A reader placing an interval from this
+        function in that table needs this number beside it. The intraclass
+        correlation of a continuous outcome is a different function, and it is
+        not this one.
     table
         Cross-tabulation of counts, shape ``(n_categories, n_categories)``.
         **Rows are the judge, columns are the human**, in the order given by
@@ -301,6 +319,7 @@ class JudgeAgreementResult:
     p_expected: float
     prevalence_index: float
     bias_index: float
+    disagreement_icc: float
     table: NDArray[np.int64]
     n_items: int
     n_clusters: int
@@ -371,6 +390,43 @@ def _encode(
                 "this function may add"
             ) from None
     return codes
+
+
+def _disagreement_icc(
+    disagreement: NDArray[np.float64], cluster: ArrayLike | None
+) -> float:
+    """One-way ICC(1) of a per-item quantity across clusters, unbalanced form.
+
+    ``MS_between`` and ``MS_within`` are the usual one-way ANOVA mean squares;
+    with unequal cluster sizes the "items per cluster" in the ICC formula is
+    replaced by ``m0 = (N - sum(n_c**2) / N) / (k - 1)``, which reduces to
+    ``m`` when every cluster has ``m`` items. Returns ``nan`` when there is
+    nothing within clusters to compare (no clustering, or every cluster a
+    single item) and when both mean squares are zero.
+
+    Runs after the resampler has validated ``cluster``, so it does not repeat
+    the shape check and would not be reached with a malformed one.
+    """
+    if cluster is None:
+        return float("nan")
+    _, codes = np.unique(np.asarray(cluster), return_inverse=True)
+    codes = codes.ravel()
+    n_items = disagreement.size
+    sizes = np.bincount(codes).astype(np.float64)
+    n_clusters = sizes.size
+    if n_items == n_clusters or n_clusters < 2:
+        return float("nan")
+    means = np.bincount(codes, weights=disagreement) / sizes
+    grand = float(disagreement.mean())
+    ms_between = float((sizes * (means - grand) ** 2).sum()) / (n_clusters - 1)
+    ms_within = float(((disagreement - means[codes]) ** 2).sum()) / (
+        n_items - n_clusters
+    )
+    m0 = (n_items - float((sizes**2).sum()) / n_items) / (n_clusters - 1)
+    denominator = ms_between + (m0 - 1.0) * ms_within
+    if denominator == 0.0:
+        return float("nan")
+    return (ms_between - ms_within) / denominator
 
 
 def _kappa(
@@ -776,6 +832,7 @@ def judge_agreement(
         bias_index=float(
             np.abs(observed.sum(axis=1) - observed.sum(axis=0)).sum() / 2.0
         ),
+        disagreement_icc=_disagreement_icc(weight[judge_codes, human_codes], cluster),
         table=table,
         n_items=n_items,
         n_clusters=drawn.n_clusters,
