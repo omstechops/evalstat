@@ -18,6 +18,18 @@ logics in one function is a way of getting one of them wrong. This module is the
 other reading of that sentence. There is one resampling logic, and it lives
 here; the two contracts stay apart, above it.
 
+Drawing and evaluating are two steps, not one. :func:`draw_resamples` draws the
+index sets and keeps them; :func:`evaluate` applies one statistic to a set of
+draws it was handed; :func:`cluster_bootstrap` is the composition and nothing
+more. The split exists for the comparison in :mod:`evalstat.agreement`, where
+three statistics have to be evaluated on the *same* resamples so that their
+difference is a paired quantity. Reproducing the draws by re-seeding would
+give the same indices today -- nothing else consumes the generator -- but that
+is a property of the current code and not a promise, and it fails outright for
+a caller-supplied generator, whose stream would simply continue. Keeping the
+indices makes "the same resamples" structural. The statistic contract is
+unchanged by the split: one index array in, one number out.
+
 Nothing in this module is public. The names re-exported from
 :mod:`evalstat.bootstrap` -- :data:`MIN_CLUSTERS`, :data:`MIN_VALID_FRACTION`,
 :class:`FewClustersWarning`, :class:`DegenerateResampleWarning` -- are the public
@@ -42,9 +54,12 @@ __all__ = [
     "MIN_VALID_FRACTION",
     "ClusterBootstrapResult",
     "DegenerateResampleWarning",
+    "Draws",
     "FewClustersWarning",
     "Method",
     "cluster_bootstrap",
+    "draw_resamples",
+    "evaluate",
 ]
 
 MIN_CLUSTERS = 25
@@ -80,6 +95,41 @@ class DegenerateResampleWarning(UserWarning):
     :data:`MIN_VALID_FRACTION` it becomes an error, because the quantity being
     reported has by then quietly become a conditional one.
     """
+
+
+@dataclass(frozen=True)
+class Draws:
+    """The resamples of one run, drawn once, evaluated any number of times.
+
+    Holds the index sets themselves rather than the seed that produced them,
+    so that two statistics evaluated on the same ``Draws`` are evaluated on the
+    same resamples by construction. See the module docstring for why that is
+    not left to re-seeding.
+
+    Attributes
+    ----------
+    indices
+        One index array per resample, in the order drawn.
+    n_items
+        Number of rows the indices range over.
+    members, starts, sizes
+        The cluster layout the draws came from; see ``_cluster_layout``. Kept
+        because the BCa jackknife leaves out whole clusters and needs it.
+    seed
+        Seed the draw ran from, or ``None`` when the caller supplied its own
+        generator, whose state cannot be recorded.
+    """
+
+    indices: tuple[NDArray[np.intp], ...]
+    n_items: int
+    members: NDArray[np.intp]
+    starts: NDArray[np.intp]
+    sizes: NDArray[np.intp]
+    seed: int | None
+
+    @property
+    def n_clusters(self) -> int:
+        return int(self.sizes.size)
 
 
 @dataclass(frozen=True)
@@ -267,6 +317,166 @@ def _bca_interval(
     return float(low), float(high)
 
 
+def draw_resamples(
+    n_items: int,
+    *,
+    cluster: ArrayLike | None = None,
+    unit: str = "item",
+    n_resamples: int = 10_000,
+    rng: int | np.random.Generator | None = None,
+    stacklevel: int = 3,
+) -> Draws:
+    """Draw ``n_resamples`` with-replacement resamples of whole clusters.
+
+    Parameters
+    ----------
+    n_items, cluster, unit, n_resamples, rng
+        As on :func:`cluster_bootstrap`.
+    stacklevel
+        Frames between this function and the caller who should see the
+        few-clusters warning. 3 when a public function calls this directly;
+        :func:`cluster_bootstrap` passes 4 for the frame it adds.
+
+    Raises
+    ------
+    ValueError
+        If the clustering does not match ``n_items`` or fewer than two clusters
+        are present.
+
+    Warns
+    -----
+    FewClustersWarning
+    """
+    if n_resamples < 1:
+        raise ValueError(f"n_resamples must be positive, got {n_resamples}")
+
+    members, starts, sizes = _cluster_layout(cluster, n_items, unit)
+    n_clusters = int(sizes.size)
+    if n_clusters < 2:
+        raise ValueError(f"need at least 2 clusters to resample, got {n_clusters}")
+    if n_clusters < MIN_CLUSTERS:
+        warnings.warn(
+            f"{n_clusters} clusters is below {MIN_CLUSTERS}; the cluster "
+            "bootstrap is consistent in the number of clusters, and at this "
+            "count the percentile interval under-covers — the interval it "
+            "reports is narrower than the truth, not wider",
+            FewClustersWarning,
+            stacklevel=stacklevel,
+        )
+
+    if isinstance(rng, np.random.Generator):
+        generator, seed = rng, None
+    else:
+        seed = secrets.randbits(64) if rng is None else int(rng)
+        generator = np.random.default_rng(seed)
+
+    indices = tuple(
+        _draw_indices(generator, members, starts, sizes) for _ in range(n_resamples)
+    )
+    return Draws(
+        indices=indices,
+        n_items=n_items,
+        members=members,
+        starts=starts,
+        sizes=sizes,
+        seed=seed,
+    )
+
+
+def evaluate(
+    statistic: Statistic,
+    draws: Draws,
+    *,
+    confidence_level: float = 0.95,
+    method: Method = "percentile",
+    stacklevel: int = 3,
+) -> ClusterBootstrapResult:
+    """Apply ``statistic`` to every resample in ``draws`` and build the interval.
+
+    Parameters
+    ----------
+    statistic
+        Applied to the item indices of one resample; see :data:`Statistic`.
+    draws
+        From :func:`draw_resamples`. Evaluating two statistics on one
+        ``Draws`` is how a paired comparison is built.
+    confidence_level, method
+        As on :func:`cluster_bootstrap`.
+    stacklevel
+        As on :func:`draw_resamples`, for the degenerate-resample warning.
+
+    Raises
+    ------
+    ValueError
+        If the interval arguments are malformed, or more than
+        ``1 - MIN_VALID_FRACTION`` of resamples failed to produce a finite
+        statistic.
+
+    Warns
+    -----
+    DegenerateResampleWarning
+    """
+    n_resamples = len(draws.indices)
+    check_resampling_arguments(n_resamples, confidence_level, method)
+
+    estimate = float(statistic(np.arange(draws.n_items, dtype=np.intp)))
+    values = np.fromiter(
+        (statistic(idx) for idx in draws.indices), dtype=np.float64, count=n_resamples
+    )
+
+    finite = np.isfinite(values)
+    distribution = values[finite]
+    n_valid = int(distribution.size)
+    if n_valid < MIN_VALID_FRACTION * n_resamples:
+        raise ValueError(
+            f"only {n_valid} of {n_resamples} resamples produced a finite "
+            f"statistic, below the {MIN_VALID_FRACTION:.0%} floor. What is "
+            "left is a conditional quantity — the statistic among resamples "
+            "where it happened to be defined — and returning it as though it "
+            "were the requested one would be wrong"
+        )
+    if n_valid < n_resamples:
+        warnings.warn(
+            f"{n_resamples - n_valid} of {n_resamples} resamples produced no "
+            "finite statistic and were discarded",
+            DegenerateResampleWarning,
+            stacklevel=stacklevel,
+        )
+
+    alpha = 1.0 - confidence_level
+    if method == "percentile":
+        ci_low, ci_high = _percentile_interval(distribution, alpha)
+    elif method == "basic":
+        ci_low, ci_high = _basic_interval(distribution, estimate, alpha)
+    else:
+        ci_low, ci_high = _bca_interval(
+            distribution,
+            estimate,
+            alpha,
+            statistic,
+            draws.n_items,
+            draws.members,
+            draws.starts,
+            draws.sizes,
+        )
+
+    sizes = draws.sizes
+    return ClusterBootstrapResult(
+        estimate=estimate,
+        ci_low=ci_low,
+        ci_high=ci_high,
+        n_clusters=draws.n_clusters,
+        cluster_sizes=(
+            int(sizes.min()),
+            int(np.median(sizes)),
+            int(sizes.max()),
+        ),
+        n_valid=n_valid,
+        seed=draws.seed,
+        distribution=distribution,
+    )
+
+
 def cluster_bootstrap(
     statistic: Statistic,
     n_items: int,
@@ -279,6 +489,9 @@ def cluster_bootstrap(
     rng: int | np.random.Generator | None = None,
 ) -> ClusterBootstrapResult:
     """Bootstrap ``statistic`` by resampling whole clusters with replacement.
+
+    The composition of :func:`draw_resamples` and :func:`evaluate`, for the
+    common case of one statistic.
 
     Parameters
     ----------
@@ -309,84 +522,22 @@ def cluster_bootstrap(
     Warns
     -----
     FewClustersWarning, DegenerateResampleWarning
-        Both at ``stacklevel=3``, so they surface at whoever called the public
-        function rather than inside it.
+        Both surface at whoever called the public function rather than inside
+        it.
     """
     check_resampling_arguments(n_resamples, confidence_level, method)
-
-    members, starts, sizes = _cluster_layout(cluster, n_items, unit)
-    n_clusters = int(sizes.size)
-    if n_clusters < 2:
-        raise ValueError(f"need at least 2 clusters to resample, got {n_clusters}")
-    if n_clusters < MIN_CLUSTERS:
-        warnings.warn(
-            f"{n_clusters} clusters is below {MIN_CLUSTERS}; the cluster "
-            "bootstrap is consistent in the number of clusters, and at this "
-            "count the percentile interval under-covers — the interval it "
-            "reports is narrower than the truth, not wider",
-            FewClustersWarning,
-            stacklevel=3,
-        )
-
-    if isinstance(rng, np.random.Generator):
-        generator, seed = rng, None
-    else:
-        seed = secrets.randbits(64) if rng is None else int(rng)
-        generator = np.random.default_rng(seed)
-
-    estimate = float(statistic(np.arange(n_items, dtype=np.intp)))
-    values = np.empty(n_resamples, dtype=np.float64)
-    for i in range(n_resamples):
-        idx = _draw_indices(generator, members, starts, sizes)
-        values[i] = statistic(idx)
-
-    finite = np.isfinite(values)
-    distribution = values[finite]
-    n_valid = int(distribution.size)
-    if n_valid < MIN_VALID_FRACTION * n_resamples:
-        raise ValueError(
-            f"only {n_valid} of {n_resamples} resamples produced a finite "
-            f"statistic, below the {MIN_VALID_FRACTION:.0%} floor. What is "
-            "left is a conditional quantity — the statistic among resamples "
-            "where it happened to be defined — and returning it as though it "
-            "were the requested one would be wrong"
-        )
-    if n_valid < n_resamples:
-        warnings.warn(
-            f"{n_resamples - n_valid} of {n_resamples} resamples produced no "
-            "finite statistic and were discarded",
-            DegenerateResampleWarning,
-            stacklevel=3,
-        )
-
-    alpha = 1.0 - confidence_level
-    if method == "percentile":
-        ci_low, ci_high = _percentile_interval(distribution, alpha)
-    elif method == "basic":
-        ci_low, ci_high = _basic_interval(distribution, estimate, alpha)
-    else:
-        ci_low, ci_high = _bca_interval(
-            distribution,
-            estimate,
-            alpha,
-            statistic,
-            n_items,
-            members,
-            starts,
-            sizes,
-        )
-
-    return ClusterBootstrapResult(
-        estimate=estimate,
-        ci_low=ci_low,
-        ci_high=ci_high,
-        n_clusters=n_clusters,
-        cluster_sizes=(
-            int(sizes.min()),
-            int(np.median(sizes)),
-            int(sizes.max()),
-        ),
-        n_valid=n_valid,
-        seed=seed,
-        distribution=distribution,
+    draws = draw_resamples(
+        n_items,
+        cluster=cluster,
+        unit=unit,
+        n_resamples=n_resamples,
+        rng=rng,
+        stacklevel=4,
+    )
+    return evaluate(
+        statistic,
+        draws,
+        confidence_level=confidence_level,
+        method=method,
+        stacklevel=4,
     )

@@ -233,6 +233,30 @@ depend on whether a ceiling was asked for — is open. J12 asserts the invarianc
 on a run where nothing was discarded, so the test pins the draws without
 pre-empting the rule.
 
+*Both settled 11 September, by the owner.*
+
+**The draws are kept, not re-seeded.** The resampler was split into a draw
+step and an evaluate step, with `cluster_bootstrap` as their composition; the
+scalar statistic contract is unchanged, so this is not the vector-valued
+variant that was ruled out. Three scalar passes — judge, human, difference —
+are evaluated on one `Draws`. Re-seeding was rejected because it holds today
+only as a property of the current code (nothing else consumes the generator)
+and fails outright for a caller-supplied `Generator`, whose stream continues
+into the second pass; J12 used integer seeds, so that fault would have lived
+exactly where the test did not look — §3.5.6 of the retrospective, live. The
+guarantee is asserted on the output rather than inferred from the mechanism:
+`HumanCeiling` carries the human kappa's `distribution`, and J12 asserts
+`judge.distribution - ceiling.distribution == difference_distribution` element
+by element, under an integer seed and under a `Generator`.
+
+**A resample undefined for either pair is dropped from all three.** The three
+passes share one validity rule (both kappas finite), so `n_valid` counts one
+common set and every number in the result comes from it. The judge's own
+interval can therefore differ slightly between a call with `ceiling=` and one
+without; the alternative was one result object carrying numbers from two
+samplings with nothing in it saying which. J12 pins the rule on data built so
+that only the human pair can degenerate.
+
 ## 7. Degenerate tables (D8)
 
 **Corrected when the body was written.** This section first said the denominator

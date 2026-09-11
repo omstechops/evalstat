@@ -116,6 +116,18 @@ come from the same resamples, because they are computed on the same items and
 are correlated. Two independently drawn intervals would give a difference
 interval that is wrong in a direction nobody would check.
 
+"The same resamples" is structural, not reproduced: the index sets are drawn
+once and the three statistics -- judge kappa, human kappa, their difference --
+are evaluated on that one set of draws. Re-seeding would reproduce the draws
+today and would silently stop doing so for a caller-supplied generator, whose
+stream simply continues; see :mod:`evalstat._resample`. A resample in which
+either kappa is undefined is discarded from all three, so every number in the
+result comes from one and the same set of valid resamples and ``n_valid``
+counts that set. The judge's own interval can therefore differ slightly
+between a call with ``ceiling=`` and one without, when a resample the human
+pair could not define is dropped; that is the cost of not carrying two
+different samplings in one result object, and it is paid knowingly.
+
 Not here, deliberately
 ----------------------
 Krippendorff's alpha, Gwet's AC1/AC2, PABAK, more than two raters, and any
@@ -137,6 +149,8 @@ from evalstat._resample import (
     Method,
     check_resampling_arguments,
     cluster_bootstrap,
+    draw_resamples,
+    evaluate,
 )
 
 __all__ = [
@@ -175,8 +189,14 @@ class HumanCeiling:
         Interval for ``difference``, from the resamples both kappas were
         computed on. Narrower than an interval built as though the two were
         independent, because they are not.
+    distribution
+        The resampled human-human coefficients, aligned resample by resample
+        with the judge's ``distribution`` on the parent result.
     difference_distribution
-        The resampled differences, one per valid resample.
+        The resampled differences, one per valid resample. Equal, element by
+        element, to the judge's ``distribution`` minus ``distribution`` here;
+        that equality is what "the same resamples" means, and it is what the
+        tests check rather than the mechanism that produces it.
     """
 
     kappa: float
@@ -185,6 +205,7 @@ class HumanCeiling:
     difference: float
     difference_ci_low: float
     difference_ci_high: float
+    distribution: NDArray[np.float64]
     difference_distribution: NDArray[np.float64]
 
 
@@ -255,6 +276,8 @@ class JudgeAgreementResult:
         Resamples requested.
     n_valid
         Resamples that yielded a finite coefficient and entered the interval.
+        With ``ceiling``, resamples on which *both* coefficients were finite:
+        one set of valid resamples serves every number in the result.
     seed
         Seed the resampling ran from. Populated even when the caller passed
         nothing; ``None`` only when the caller supplied its own
@@ -645,23 +668,100 @@ def judge_agreement(
             "is not an error: it gives exactly 0"
         )
 
-    if ceiling is not None:
-        raise NotImplementedError(
-            "the human ceiling comparison is not implemented yet; the "
-            "coefficient and its diagnostics are. See section 6 of "
-            "docs/design/judge_agreement.md"
+    def judge_kappa(idx: NDArray[np.intp]) -> float:
+        return _kappa(judge_codes[idx], human_codes[idx], weight)
+
+    if ceiling is None:
+        drawn = cluster_bootstrap(
+            judge_kappa,
+            n_items,
+            cluster=cluster,
+            unit="rated item",
+            n_resamples=n_resamples,
+            confidence_level=confidence_level,
+            method=method,
+            rng=rng,
+        )
+        comparison = None
+    else:
+        ceiling_table = _cross_table(ceiling_codes, human_codes, n_categories)
+        ceiling_observed = ceiling_table / n_items
+        if (
+            float(
+                (
+                    weight
+                    * np.outer(
+                        ceiling_observed.sum(axis=1), ceiling_observed.sum(axis=0)
+                    )
+                ).sum()
+            )
+            == 0.0
+        ):
+            used = declared[int(np.argmax(np.diag(ceiling_table)))]
+            raise ValueError(
+                f"both humans used the category {used!r} for all {n_items} "
+                "rated items, so the human-human kappa is undefined and there "
+                "is no ceiling to compare against; see the judge-human case "
+                "above for why this is an error and not a NaN"
+            )
+
+        def human_kappa(idx: NDArray[np.intp]) -> float:
+            return _kappa(ceiling_codes[idx], human_codes[idx], weight)
+
+        def both(idx: NDArray[np.intp]) -> tuple[float, float]:
+            # One validity rule for all three statistics: a resample on which
+            # either coefficient is undefined is undefined for the judge, the
+            # human and the difference alike, so the three passes below
+            # discard the same resamples and n_valid counts one common set.
+            # _kappa returns nan and never inf, so the difference carries the
+            # rule on its own; the judge and human need it imposed.
+            j, h = judge_kappa(idx), human_kappa(idx)
+            if not (np.isfinite(j) and np.isfinite(h)):
+                return float("nan"), float("nan")
+            return j, h
+
+        # Three scalar passes over one set of draws. Each pass computes both
+        # kappas and keeps one, so a resample costs six kappa evaluations
+        # instead of two. A kappa is one bincount over the resample and the
+        # whole run is milliseconds; the alternative -- a statistic returning
+        # three numbers -- would put a second contract into the resampler,
+        # which is what the index-keyed core exists to avoid.
+        draws = draw_resamples(
+            n_items,
+            cluster=cluster,
+            unit="rated item",
+            n_resamples=n_resamples,
+            rng=rng,
+        )
+        drawn = evaluate(
+            lambda idx: both(idx)[0],
+            draws,
+            confidence_level=confidence_level,
+            method=method,
+        )
+        humans = evaluate(
+            lambda idx: both(idx)[1],
+            draws,
+            confidence_level=confidence_level,
+            method=method,
+        )
+        gap = evaluate(
+            lambda idx: both(idx)[0] - both(idx)[1],
+            draws,
+            confidence_level=confidence_level,
+            method=method,
+        )
+        comparison = HumanCeiling(
+            kappa=humans.estimate,
+            ci_low=humans.ci_low,
+            ci_high=humans.ci_high,
+            difference=gap.estimate,
+            difference_ci_low=gap.ci_low,
+            difference_ci_high=gap.ci_high,
+            distribution=humans.distribution,
+            difference_distribution=gap.distribution,
         )
 
-    drawn = cluster_bootstrap(
-        lambda idx: _kappa(judge_codes[idx], human_codes[idx], weight),
-        n_items,
-        cluster=cluster,
-        unit="rated item",
-        n_resamples=n_resamples,
-        confidence_level=confidence_level,
-        method=method,
-        rng=rng,
-    )
     return JudgeAgreementResult(
         kappa=drawn.estimate,
         ci_low=drawn.ci_low,
@@ -684,5 +784,5 @@ def judge_agreement(
         n_valid=drawn.n_valid,
         seed=drawn.seed,
         distribution=drawn.distribution,
-        ceiling=None,
+        ceiling=comparison,
     )

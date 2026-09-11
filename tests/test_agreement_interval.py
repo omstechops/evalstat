@@ -36,7 +36,7 @@ import pytest
 from numpy.typing import NDArray
 from sklearn.metrics import cohen_kappa_score
 
-from evalstat import FewClustersWarning
+from evalstat import DegenerateResampleWarning, FewClustersWarning
 from evalstat.agreement import judge_agreement
 
 CATEGORIES = (0, 1, 2)
@@ -339,6 +339,92 @@ def test_j12_ceiling_difference_comes_from_the_same_resamples() -> None:
         result.ci_low - result.ceiling.ci_high
     )
     assert paired_width < independent_width
+
+
+@pytest.mark.parametrize(
+    "rng",
+    [22, np.random.default_rng(22)],
+    ids=["seed", "generator"],
+)
+def test_j12_the_three_distributions_are_aligned_resample_by_resample(
+    rng: int | np.random.Generator,
+) -> None:
+    """Check "the same resamples" on the output, not by reading the mechanism.
+
+    If the judge's, the human's and the difference's distributions come from
+    one set of draws, then resample by resample the difference is exactly the
+    judge minus the human -- the same two floats, subtracted once. That
+    equality is asserted element by element, which no narrowness comparison
+    can stand in for: a difference statistic evaluated on its own draws is
+    paired within itself and comes out narrow whether or not the other two
+    passes saw the same indices.
+
+    Both kinds of ``rng`` are run because they are the two cases a re-seeding
+    design would have separated. With an integer seed a second pass re-seeded
+    from it reproduces the first pass's draws; with a caller-supplied
+    generator it continues the stream instead, and the three distributions
+    silently stop lining up. A test written only with integer seeds would pass
+    over exactly that fault. The draws are kept rather than re-seeded, so both
+    cases have to hold, and both are pinned here.
+    """
+    (judge, human, second), cluster = clustered_ratings(
+        np.random.default_rng(21), 40, 3, n_raters=3
+    )
+
+    result = agree(
+        judge, human, cluster=cluster, ceiling=second, n_resamples=999, rng=rng
+    )
+    assert result.ceiling is not None
+
+    assert result.distribution.size == result.n_valid
+    assert result.ceiling.distribution.size == result.n_valid
+    assert result.ceiling.difference_distribution.size == result.n_valid
+    assert np.array_equal(
+        result.distribution - result.ceiling.distribution,
+        result.ceiling.difference_distribution,
+    )
+
+
+def test_j12_a_resample_undefined_for_either_pair_is_dropped_from_both() -> None:
+    """One set of valid resamples serves every number in the result.
+
+    The rule settled when the body was written: a resample on which either
+    kappa is undefined is discarded from the judge's interval, the human's and
+    the difference's alike, and ``n_valid`` counts the common set. The
+    alternative -- discarding it from the difference only -- would leave the
+    result carrying numbers from two different samplings, and nothing in the
+    object would say which number came from which.
+
+    The data is built so that only the human pair can degenerate. Thirty items,
+    each its own cluster; the human and the second human agree exactly, and
+    both use category 1 on four items and 0 on the rest, so a resample that
+    misses all four leaves them constant on one shared category. The judge
+    cycles through all three categories and is never constant, so the judge
+    pair is defined on every resample: at the same seed, the call without
+    ``ceiling`` discards nothing. The probability of missing all four is
+    ``(26/30)**30``, about 1.4%, well under the floor that turns the warning
+    into an error.
+    """
+    human = np.zeros(30, dtype=np.intp)
+    human[[3, 11, 19, 27]] = 1
+    second = human.copy()
+    judge = np.tile(np.arange(3, dtype=np.intp), 10)
+
+    alone = agree(judge, human, n_resamples=999, rng=31)
+    assert alone.n_valid == alone.n_resamples
+
+    with pytest.warns(DegenerateResampleWarning):
+        result = agree(judge, human, ceiling=second, n_resamples=999, rng=31)
+    assert result.ceiling is not None
+
+    assert result.n_valid < result.n_resamples
+    assert result.distribution.size == result.n_valid
+    assert result.ceiling.distribution.size == result.n_valid
+    assert result.ceiling.difference_distribution.size == result.n_valid
+    assert np.array_equal(
+        result.distribution - result.ceiling.distribution,
+        result.ceiling.difference_distribution,
+    )
 
 
 def test_j12_the_ceiling_is_an_addition_not_a_modification() -> None:
